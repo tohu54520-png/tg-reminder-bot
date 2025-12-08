@@ -301,7 +301,7 @@ async def single_date_got_time(update: Update, context: ContextTypes.DEFAULT_TYP
 # ========= 單一日期 flow：內容層 =========
 
 async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """收到提醒內容，建立排程。"""
+    """收到提醒內容，建立排程（不顯示內容本身，避免洗頻）"""
     content = (update.message.text or "").strip()
     if not content:
         await update.message.reply_text("提醒內容不能是空的，請再輸入一次。")
@@ -314,16 +314,17 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("內部資料遺失，請重新從 /start 開始設定一次 🙏")
         return MENU
 
-    now = datetime.now(TZ)
+    # ✅ 使用「沒有 tzinfo 的 datetime」，避免 JobQueue 出錯
+    now = datetime.now()
     year = now.year
-    run_at = datetime(year, month, day, hour, minute, tzinfo=TZ)
+    run_at = datetime(year, month, day, hour, minute)
+
     if run_at <= now:
-        # 如果時間已過，往後推一年（簡單處理）
-        run_at = datetime(year + 1, month, day, hour, minute, tzinfo=TZ)
+        run_at = datetime(year + 1, month, day, hour, minute)
 
     when_str = run_at.strftime("%m/%d %H:%M")
 
-    # 建立提醒 Job
+    # ✅ 建立提醒 Job
     context.job_queue.run_once(
         reminder_job,
         when=run_at,
@@ -335,16 +336,17 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         name=f"single-{update.effective_chat.id}-{run_at.isoformat()}",
     )
 
-    # ✅ 4. 完成提示改成「已記錄 12/08 17:06 wm。」
-    await update.message.reply_text(f"已記錄 {when_str} {content}。")
+    # ✅【這一行就是你要的最終顯示格式】
+    await update.message.reply_text(f"✅ 已記錄 {when_str} 提醒")
 
-    # 回到主選單
+    # ✅ 回主選單
     await send_main_menu(
         update.effective_chat.id,
         context,
         "還需要我幫你設什麼提醒嗎？",
     )
     return MENU
+
 
 
 # ========= Bot 啟動邏輯 =========
@@ -435,3 +437,4 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("FastAPI app is shutting down.")
+
