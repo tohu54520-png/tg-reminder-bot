@@ -302,10 +302,7 @@ async def single_date_got_time(update: Update, context: ContextTypes.DEFAULT_TYP
 # ========= 單一日期 flow：內容層 =========
 
 async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    收到提醒內容，建立排程。
-    最後只顯示「已記錄 MM/DD HH:MM 提醒」，不把內容印出，避免洗頻。
-    """
+    """收到提醒內容，建立排程（不顯示內容本身，避免洗頻）"""
     content = (update.message.text or "").strip()
     if not content:
         await update.message.reply_text("提醒內容不能是空的，請再輸入一次。")
@@ -314,34 +311,32 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     month, day = context.user_data.get("sd_date", (None, None))
     hour, minute = context.user_data.get("sd_time", (None, None))
 
-    if None in (month, day, hour, minute):
+    if month is None or day is None or hour is None or minute is None:
         await update.message.reply_text("內部資料遺失，請重新從 /start 開始設定一次 🙏")
         return MENU
 
-    # 直接用系統時間就好（naive datetime）
-    now = datetime.now()
+    # ✅ 用「台北時區」來計算現在時間 & 排程時間
+    now = datetime.now(TZ)
     year = now.year
+    run_at = datetime(year, month, day, hour, minute, tzinfo=TZ)
 
-    # 建立「下一次」要提醒的時間；如果今年這個時間已過，就 +1 年
-    run_at = datetime(year, month, day, hour, minute)
+    # 若時間已過，往下一年推（之後你可以改成更符合需求的邏輯）
     if run_at <= now:
-        run_at = datetime(year + 1, month, day, hour, minute)
+        run_at = datetime(year + 1, month, day, hour, minute, tzinfo=TZ)
 
     when_str = run_at.strftime("%m/%d %H:%M")
 
-    # ✅ 正確取得 JobQueue（經由 context.application）
+    # 透過 Application 取得 JobQueue
     job_queue = context.application.job_queue
-
     if job_queue is None:
         logger.error("JobQueue is None; cannot schedule job.")
         await update.message.reply_text("內部錯誤：JobQueue 未啟用，請稍後再試一次 🙏")
         return MENU
 
-    # 建立提醒 Job
     try:
         job_queue.run_once(
             reminder_job,
-            when=run_at,
+            when=run_at,   # ✅ 直接丟帶時區的 datetime 給 JobQueue
             data={
                 "chat_id": update.effective_chat.id,
                 "text": content,
@@ -354,7 +349,7 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("建立提醒時發生錯誤，麻煩稍後再試一次 🙏")
         return MENU
 
-    # ✅ 最終提示文字（不顯示內容本身）
+    # ✅ 最終提示（不顯示內容，避免洗頻）
     await update.message.reply_text(f"✅ 已記錄 {when_str} 提醒")
 
     # 回主選單
@@ -364,6 +359,7 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         "還需要我幫你設什麼提醒嗎？",
     )
     return MENU
+
 
 
 
@@ -473,4 +469,5 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("FastAPI app is shutting down.")
+
 
