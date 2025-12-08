@@ -26,9 +26,8 @@ from telegram.error import TimedOut
 # ========= 基本設定 =========
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
-TZ = ZoneInfo("Asia/Taipei")  # 預設時區
-
-DB_PATH = "reminders.db"  # SQLite 檔案路徑
+TZ = ZoneInfo("Asia/Taipei")
+DB_PATH = "reminders.db"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -45,8 +44,49 @@ app = FastAPI()
     SD_DATE,              # 單一日期：輸入日期
     SD_TIME,              # 單一日期：輸入時間
     SD_TEXT,              # 單一日期：輸入內容
-    REMINDER_LIST,        # 所有提醒列表
-) = range(6)
+    PEOPLE_MENU,          # 人員名單編輯主畫面
+    PEOPLE_ADD_INPUT,     # 人員名單編輯：輸入批量名單
+) = range(7)
+
+# ========= DB 初始化 =========
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # 提醒資料
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reminders (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            kind    TEXT    NOT NULL,
+            run_at  INTEGER NOT NULL,  -- Unix timestamp
+            text    TEXT    NOT NULL
+        )
+        """
+    )
+
+    # 可被設為 @ 目標的人員名單
+    # handle = TG ID / 使用者名稱（例如 @tohu54520 或純文字 ID）
+    # alias  = 顯示的小名，方便之後刪除、辨識
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mention_targets (
+            chat_id INTEGER NOT NULL,
+            handle  TEXT    NOT NULL,
+            alias   TEXT    NOT NULL,
+            PRIMARY KEY (chat_id, handle)
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
 
 # ========= FastAPI 路由 =========
 
@@ -56,74 +96,8 @@ async def root():
     return {"status": "ok"}
 
 
-# ========= SQLite 工具 =========
-
-def init_db():
-    """初始化 SQLite 資料庫。"""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reminders (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            kind    TEXT    NOT NULL,   -- general_single / apk / lottery ... etc
-            run_at  INTEGER NOT NULL,   -- Unix timestamp（秒）
-            text    TEXT    NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-    logger.info("DB initialized.")
-
-
-def db_add_reminder(chat_id: int, kind: str, run_at: datetime, text: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO reminders (chat_id, kind, run_at, text) VALUES (?, ?, ?, ?)",
-        (chat_id, kind, int(run_at.timestamp()), text),
-    )
-    reminder_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return reminder_id
-
-
-def db_list_reminders(chat_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, kind, run_at, text FROM reminders WHERE chat_id=? ORDER BY run_at ASC",
-        (chat_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def db_get_reminder(reminder_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, chat_id, kind, run_at, text FROM reminders WHERE id=?",
-        (reminder_id,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def db_delete_reminder(reminder_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
-    conn.commit()
-    conn.close()
-
-
 # ========= 小工具 =========
+
 
 def parse_mmdd(text: str):
     """解析 MMDD，回傳 (month, day) 或 None。"""
@@ -133,7 +107,7 @@ def parse_mmdd(text: str):
     month = int(text[:2])
     day = int(text[2:])
     try:
-        datetime(2000, month, day)  # 年份隨便給一個，只為了驗證是否合法
+        datetime(2000, month, day)
     except ValueError:
         return None
     return month, day
@@ -151,13 +125,9 @@ def parse_hhmm(text: str):
     return hour, minute
 
 
-def format_ts(ts: int) -> str:
-    """把 timestamp 轉成 MM/DD HH:MM（台北時間）。"""
-    dt = datetime.fromtimestamp(ts, TZ)
-    return dt.strftime("%m/%d %H:%M")
-
-
-async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str = "請選擇功能："):
+async def send_main_menu(
+    chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str = "請選擇功能："
+):
     """發送主選單 Inline Keyboard。"""
     keyboard = [
         [InlineKeyboardButton("一般提醒", callback_data="menu_general")],
@@ -172,27 +142,20 @@ async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text:
 
 # ========= JobQueue：提醒任務 =========
 
+
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
     text = data["text"]
     when_str = data["when_str"]
-    reminder_id = data.get("reminder_id")
-
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"⏰ 提醒時間到囉（{when_str}）：\n{text}",
     )
 
-    # Job 執行完，把這筆提醒從 DB 刪掉（如果還在）
-    if reminder_id is not None:
-        try:
-            db_delete_reminder(reminder_id)
-        except Exception as e:
-            logger.warning("刪除提醒（ID=%s）時發生錯誤：%s", reminder_id, e)
-
 
 # ========= 指令處理 =========
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """進入主選單。"""
@@ -209,116 +172,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("目前指令：\n/start - 主選單\n/help - 顯示這個說明")
 
 
-# ========= 所有提醒列表 =========
-
-async def send_reminder_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """發送『所有提醒列表』畫面。"""
-    rows = db_list_reminders(chat_id)
-    if not rows:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="【所有提醒列表】\n目前這個聊天室還沒有任何提醒～",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ 返回主選單", callback_data="reminder_back_main")]]
-            ),
-        )
-        return
-
-    keyboard = []
-    for rid, kind, run_at, text in rows:
-        when_str = format_ts(run_at)
-        kind_label = {
-            "general_single": "一般提醒",
-            "apk": "谷歌APK",
-            "lottery": "香港六合彩",
-        }.get(kind, kind)
-        label = f"{when_str}｜{kind_label}"
-        keyboard.append(
-            [InlineKeyboardButton(label, callback_data=f"reminder_{rid}")]
-        )
-
-    keyboard.append(
-        [InlineKeyboardButton("⬅️ 返回主選單", callback_data="reminder_back_main")]
-    )
-
-    markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="【所有提醒列表】\n點選下面任一項目，可以查看或刪除提醒：",
-        reply_markup=markup,
-    )
-
-
-async def reminder_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """處理『所有提醒列表』相關的所有 callback。"""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    chat_id = query.message.chat_id
-
-    # 回主選單
-    if data == "reminder_back_main":
-        await send_main_menu(chat_id, context)
-        return MENU
-
-    # 回列表（目前其實就是再發一次列表）
-    if data == "reminder_back_list":
-        await send_reminder_list(chat_id, context)
-        return REMINDER_LIST
-
-    # 刪除
-    if data.startswith("reminder_delete_"):
-        rid = int(data.split("_")[-1])
-        # 先刪 DB
-        db_delete_reminder(rid)
-        # 再取消 Job
-        job_name = f"reminder-{rid}"
-        jobs = context.application.job_queue.get_jobs_by_name(job_name)
-        for job in jobs:
-            job.schedule_removal()
-
-        await query.message.reply_text("✅ 已刪除這筆提醒。")
-        await send_reminder_list(chat_id, context)
-        return REMINDER_LIST
-
-    # 查看詳細
-    if data.startswith("reminder_"):
-        rid = int(data.split("_")[-1])
-        row = db_get_reminder(rid)
-        if not row:
-            await query.message.reply_text("這筆提醒已不存在，可能剛剛被刪除或已經觸發了。")
-            await send_reminder_list(chat_id, context)
-            return REMINDER_LIST
-
-        _id, _chat_id, kind, run_at, text = row
-        when_str = format_ts(run_at)
-        kind_label = {
-            "general_single": "一般提醒",
-            "apk": "谷歌APK",
-            "lottery": "香港六合彩",
-        }.get(kind, kind)
-
-        detail = (
-            f"【提醒詳細】\n"
-            f"類型：{kind_label}\n"
-            f"時間：{when_str}\n"
-            f"內容：{text}\n\n"
-            f"目前先提供刪除功能，時間／內容編輯之後再幫你加上。"
-        )
-
-        keyboard = [
-            [InlineKeyboardButton("🗑 刪除提醒", callback_data=f"reminder_delete_{rid}")],
-            [InlineKeyboardButton("⬅️ 返回列表", callback_data="reminder_back_list")],
-            [InlineKeyboardButton("⬅️ 返回主選單", callback_data="reminder_back_main")],
-        ]
-        await query.message.reply_text(detail, reply_markup=InlineKeyboardMarkup(keyboard))
-        return REMINDER_LIST
-
-    # 預設：留在列表狀態
-    return REMINDER_LIST
-
-
 # ========= 主選單 Callback =========
+
 
 async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -330,7 +185,6 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 一般提醒子選單
         keyboard = [
             [
-                # 單一日期在左邊，固定週期右邊
                 InlineKeyboardButton("單一日期", callback_data="general_single"),
                 InlineKeyboardButton("固定週期（尚未實作）", callback_data="general_cycle"),
             ],
@@ -340,10 +194,18 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text("【一般提醒】請選擇類型：", reply_markup=markup)
         return GENERAL_MENU
 
-    if data == "menu_list":
-        # 所有提醒列表
-        await send_reminder_list(chat_id, context)
-        return REMINDER_LIST
+    elif data == "menu_people":
+        # 人員名單編輯主畫面
+        keyboard = [
+            [
+                InlineKeyboardButton("新增", callback_data="people_add_manual"),
+                InlineKeyboardButton("刪除", callback_data="people_delete_menu"),
+            ],
+            [InlineKeyboardButton("⬅️ 返回主選單", callback_data="people_back_main")],
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text("【人員名單編輯】請選擇操作：", reply_markup=markup)
+        return PEOPLE_MENU
 
     elif data.startswith("menu_"):
         # 其他主選單項目暫時先給個提示
@@ -355,6 +217,7 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ========= 一般提醒選單 Callback =========
 
+
 async def general_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -362,7 +225,6 @@ async def general_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = query.message.chat_id
 
     if data == "general_back":
-        # 回主選單
         await send_main_menu(chat_id, context)
         return MENU
 
@@ -390,6 +252,7 @@ async def general_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ========= 單一日期 flow：日期層 =========
+
 
 async def back_from_date_to_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """在輸入日期這層，按『返回上一頁』。"""
@@ -435,6 +298,7 @@ async def single_date_got_date(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ========= 單一日期 flow：時間層 =========
+
 
 async def back_from_time_to_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """在時間層按『修改日期』，回到輸入日期。"""
@@ -496,6 +360,7 @@ async def single_date_got_time(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ========= 單一日期 flow：內容層 =========
 
+
 async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """收到提醒內容，建立排程（不顯示內容本身，避免洗頻）"""
     content = (update.message.text or "").strip()
@@ -514,40 +379,50 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     year = now.year
     run_at = datetime(year, month, day, hour, minute, tzinfo=TZ)
 
-    # 如果時間已經過了，預設往下一年
+    # 如果時間已經過了，就排到下一年
     if run_at <= now:
         run_at = datetime(year + 1, month, day, hour, minute, tzinfo=TZ)
 
     when_str = run_at.strftime("%m/%d %H:%M")
 
-    chat_id = update.effective_chat.id
-
+    # 存進資料庫
     try:
-        # 先寫進 DB
-        reminder_id = db_add_reminder(chat_id, "general_single", run_at, content)
-
-        # 再建立提醒 Job，name 綁 reminder_id，之後刪除用
-        job_name = f"reminder-{reminder_id}"
-        context.application.job_queue.run_once(
-            reminder_job,
-            when=run_at.astimezone(TZ),
-            data={
-                "chat_id": chat_id,
-                "text": content,
-                "when_str": when_str,
-                "reminder_id": reminder_id,
-            },
-            name=job_name,
-        )
-
-        await update.message.reply_text(f"✅ 已記錄 {when_str} 提醒")
-
-    except Exception as e:
-        logger.exception("建立單一日期提醒 job 失敗：%s", e)
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO reminders (chat_id, kind, run_at, text)
+                VALUES (?, ?, ?, ?)
+                """,
+                (update.effective_chat.id, "general_single", int(run_at.timestamp()), content),
+            )
+            reminder_id = cur.lastrowid
+            conn.commit()
+    except Exception:
+        logger.exception("寫入提醒資料庫失敗")
         await update.message.reply_text("建立提醒時發生錯誤，麻煩稍後再試一次 🙏")
         return MENU
 
-    # 回主選單
+    # 建立 JobQueue
+    job_queue = context.application.job_queue
+    if job_queue is None:
+        logger.error("JobQueue is None; cannot schedule job.")
+        await update.message.reply_text("內部錯誤：JobQueue 未啟用，請稍後再試一次 🙏")
+        return MENU
+
+    job_queue.run_once(
+        reminder_job,
+        when=run_at,
+        data={
+            "chat_id": update.effective_chat.id,
+            "text": content,
+            "when_str": when_str,
+        },
+        name=f"single-{update.effective_chat.id}-{reminder_id}",
+    )
+
+    await update.message.reply_text(f"✅ 已記錄 {when_str} 提醒")
+
     await send_main_menu(
         update.effective_chat.id,
         context,
@@ -556,7 +431,214 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     return MENU
 
 
+# ========= 人員名單編輯 =========
+
+
+async def people_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """處理人員名單編輯相關 callback。"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat_id
+
+    # 從人員名單編輯回主選單
+    if data == "people_back_main":
+        await send_main_menu(chat_id, context)
+        return MENU
+
+    # 進入「新增」輸入模式
+    if data == "people_add_manual":
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "✅ 完成新增 / 返回", callback_data="people_add_done"
+                )
+            ]
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        text = (
+            "【人員名單編輯 ➜ 新增】\n"
+            "請輸入要新增的 TG 名單，每行一位，格式為：\n"
+            "    @TG_ID 暱稱\n"
+            "例如：\n"
+            "    @tohu54520 豆腐\n"
+            "    @tohu51234 豆渣\n\n"
+            "你可以一次貼很多行，我會幫你批量新增。\n"
+            "若輸入完畢，請按下下面的「✅ 完成新增 / 返回」。"
+        )
+        await query.message.reply_text(text, reply_markup=markup)
+        return PEOPLE_ADD_INPUT
+
+    # 從新增模式返回「人員名單編輯」主畫面
+    if data == "people_add_done":
+        keyboard = [
+            [
+                InlineKeyboardButton("新增", callback_data="people_add_manual"),
+                InlineKeyboardButton("刪除", callback_data="people_delete_menu"),
+            ],
+            [InlineKeyboardButton("⬅️ 返回主選單", callback_data="people_back_main")],
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text("【人員名單編輯】請選擇操作：", reply_markup=markup)
+        return PEOPLE_MENU
+
+    # 顯示目前名單，供刪除
+    if data == "people_delete_menu":
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT handle, alias
+                    FROM mention_targets
+                    WHERE chat_id = ?
+                    ORDER BY alias
+                    """,
+                    (chat_id,),
+                )
+                rows = cur.fetchall()
+        except Exception:
+            logger.exception("people_delete_menu 查詢失敗")
+            await query.message.reply_text("查詢名單失敗，請稍後再試一次 🙏")
+            return PEOPLE_MENU
+
+        if not rows:
+            await query.message.reply_text("目前可設置 @ 的人員名單是空的。")
+            return PEOPLE_MENU
+
+        keyboard = []
+        row_buttons = []
+        for handle, alias in rows:
+            row_buttons.append(
+                InlineKeyboardButton(
+                    alias, callback_data=f"people_del_sel:{handle}"
+                )
+            )
+            if len(row_buttons) == 2:
+                keyboard.append(row_buttons)
+                row_buttons = []
+        if row_buttons:
+            keyboard.append(row_buttons)
+        keyboard.append(
+            [InlineKeyboardButton("⬅️ 返回", callback_data="people_add_done")]
+        )
+
+        markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            "點選要從名單中移除的人：", reply_markup=markup
+        )
+        return PEOPLE_MENU
+
+    # 實際刪除單一成員
+    if data.startswith("people_del_sel:"):
+        handle = data.split(":", 1)[1]
+
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT alias FROM mention_targets
+                    WHERE chat_id = ? AND handle = ?
+                    """,
+                    (chat_id, handle),
+                )
+                row = cur.fetchone()
+                if not row:
+                    await query.message.reply_text("名單中已無此人。")
+                    return PEOPLE_MENU
+                alias = row[0]
+
+                cur.execute(
+                    """
+                    DELETE FROM mention_targets
+                    WHERE chat_id = ? AND handle = ?
+                    """,
+                    (chat_id, handle),
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("people_del_sel 失敗")
+            await query.message.reply_text("刪除失敗，請稍後再試一次 🙏")
+            return PEOPLE_MENU
+
+        await query.message.reply_text(f"已將「{alias}」自名單中移除。")
+        return PEOPLE_MENU
+
+    return PEOPLE_MENU
+
+
+async def people_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """在 PEOPLE_ADD_INPUT 狀態下，處理使用者貼上的批量名單。"""
+    chat_id = update.effective_chat.id
+    raw = (update.message.text or "").strip()
+
+    if not raw:
+        await update.message.reply_text("沒讀到任何文字，請再貼一次名單哦。")
+        return PEOPLE_ADD_INPUT
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    success_count = 0
+    error_lines = []
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for line in lines:
+                parts = line.split(maxsplit=1)
+                if len(parts) < 2:
+                    error_lines.append(line)
+                    continue
+
+                handle = parts[0].strip()
+                alias = parts[1].strip()
+
+                if not handle:
+                    error_lines.append(line)
+                    continue
+
+                if not handle.startswith("@"):
+                    handle = "@" + handle
+
+                if not alias:
+                    error_lines.append(line)
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO mention_targets (chat_id, handle, alias)
+                    VALUES (?, ?, ?)
+                    """,
+                    (chat_id, handle, alias),
+                )
+                success_count += 1
+
+            conn.commit()
+    except Exception:
+        logger.exception("people_add_input 寫入失敗")
+        await update.message.reply_text("寫入名單時發生錯誤，請稍後再試一次 🙏")
+        return PEOPLE_ADD_INPUT
+
+    msg_parts = []
+    if success_count > 0:
+        msg_parts.append(f"✅ 已新增 {success_count} 筆名單。")
+    if error_lines:
+        msg_parts.append(
+            "以下這些行格式不正確（應該是：@TG_ID 暱稱），沒有被新增：\n"
+            + "\n".join(error_lines)
+        )
+
+    msg_parts.append(
+        "若還要繼續新增，可以再貼一次名單。\n"
+        "若輸入完畢，請按「✅ 完成新增 / 返回」。"
+    )
+
+    await update.message.reply_text("\n\n".join(msg_parts))
+    return PEOPLE_ADD_INPUT
+
+
 # ========= Bot 啟動邏輯 =========
+
 
 async def run_bot():
     """持續啟動 / 維持 Telegram Bot。"""
@@ -577,7 +659,6 @@ async def run_bot():
                 .build()
             )
 
-            # ConversationHandler：包含整個主選單 + 一般提醒 ➜ 單一日期 flow + 提醒列表
             conv_handler = ConversationHandler(
                 entry_points=[CommandHandler("start", start)],
                 states={
@@ -588,19 +669,39 @@ async def run_bot():
                         CallbackQueryHandler(general_menu_callback),
                     ],
                     SD_DATE: [
-                        CallbackQueryHandler(back_from_date_to_general, pattern="^back_to_general$"),
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_date),
+                        CallbackQueryHandler(
+                            back_from_date_to_general, pattern="^back_to_general$"
+                        ),
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND, single_date_got_date
+                        ),
                     ],
                     SD_TIME: [
-                        CallbackQueryHandler(back_from_time_to_date, pattern="^back_to_date$"),
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_time),
+                        CallbackQueryHandler(
+                            back_from_time_to_date, pattern="^back_to_date$"
+                        ),
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND, single_date_got_time
+                        ),
                     ],
                     SD_TEXT: [
-                        CallbackQueryHandler(back_from_text_to_time, pattern="^back_to_time$"),
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_text),
+                        CallbackQueryHandler(
+                            back_from_text_to_time, pattern="^back_to_time$"
+                        ),
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND, single_date_got_text
+                        ),
                     ],
-                    REMINDER_LIST: [
-                        CallbackQueryHandler(reminder_list_callback),
+                    PEOPLE_MENU: [
+                        CallbackQueryHandler(people_menu_callback),
+                    ],
+                    PEOPLE_ADD_INPUT: [
+                        CallbackQueryHandler(
+                            people_menu_callback, pattern="^people_add_done$"
+                        ),
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND, people_add_input
+                        ),
                     ],
                 },
                 fallbacks=[CommandHandler("start", start)],
@@ -610,14 +711,12 @@ async def run_bot():
             application.add_handler(conv_handler)
             application.add_handler(CommandHandler("help", cmd_help))
 
-            # 初始化 & 啟動 bot
             await application.initialize()
             await application.start()
             await application.updater.start_polling()
 
             logger.info("Telegram bot started (polling).")
 
-            # 讓 bot 一直活著，直到被取消
             try:
                 while True:
                     await asyncio.sleep(3600)
@@ -638,10 +737,10 @@ async def run_bot():
 
 # ========= FastAPI lifecycle =========
 
+
 @app.on_event("startup")
 async def on_startup():
     logger.info("Startup event: creating Telegram bot task.")
-    init_db()
     asyncio.create_task(run_bot())
 
 
