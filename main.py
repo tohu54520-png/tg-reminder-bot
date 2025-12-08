@@ -318,20 +318,28 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("內部資料遺失，請重新從 /start 開始設定一次 🙏")
         return MENU
 
-    # 使用系統現在時間，只取年份
-    now = datetime.now(TZ)
+    # 直接用系統時間就好（naive datetime）
+    now = datetime.now()
     year = now.year
 
-    # 建立「下一次」要提醒的時間；如果今天已過，就 +1 年
+    # 建立「下一次」要提醒的時間；如果今年這個時間已過，就 +1 年
     run_at = datetime(year, month, day, hour, minute)
-    if run_at <= now.replace(tzinfo=None):
+    if run_at <= now:
         run_at = datetime(year + 1, month, day, hour, minute)
 
     when_str = run_at.strftime("%m/%d %H:%M")
 
-    # 建立提醒 Job（加 try/except，避免失敗時整個 handler 掛掉）
+    # ✅ 正確取得 JobQueue（經由 context.application）
+    job_queue = context.application.job_queue
+
+    if job_queue is None:
+        logger.error("JobQueue is None; cannot schedule job.")
+        await update.message.reply_text("內部錯誤：JobQueue 未啟用，請稍後再試一次 🙏")
+        return MENU
+
+    # 建立提醒 Job
     try:
-        context.job_queue.run_once(
+        job_queue.run_once(
             reminder_job,
             when=run_at,
             data={
@@ -346,7 +354,7 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("建立提醒時發生錯誤，麻煩稍後再試一次 🙏")
         return MENU
 
-    # ✅ 這句就是你要的最終提示
+    # ✅ 最終提示文字（不顯示內容本身）
     await update.message.reply_text(f"✅ 已記錄 {when_str} 提醒")
 
     # 回主選單
@@ -356,6 +364,7 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         "還需要我幫你設什麼提醒嗎？",
     )
     return MENU
+
 
 
 # ========= Bot 啟動邏輯 =========
@@ -464,3 +473,4 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("FastAPI app is shutting down.")
+
