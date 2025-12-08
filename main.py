@@ -128,7 +128,8 @@ def db_delete_reminder(reminder_id: int):
     cur.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
     conn.commit()
     conn.close()
-    
+
+
 def db_list_people(chat_id: int):
     """列出某個聊天室目前所有可 @ 的人員名單。"""
     conn = sqlite3.connect(DB_PATH)
@@ -217,6 +218,7 @@ async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text:
     markup = InlineKeyboardMarkup(keyboard)
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
+
 async def send_people_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """發送【人員名單編輯】子選單。"""
     keyboard = [
@@ -232,7 +234,6 @@ async def send_people_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         text="【人員名單編輯】請選擇操作：",
         reply_markup=markup,
     )
-
 
 # ========= JobQueue：提醒任務 =========
 
@@ -255,7 +256,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning("刪除提醒（ID=%s）時發生錯誤：%s", reminder_id, e)
 
-
 # ========= 指令處理 =========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,7 +271,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("目前指令：\n/start - 主選單\n/help - 顯示這個說明")
-
 
 # ========= 所有提醒列表 =========
 
@@ -381,14 +380,15 @@ async def reminder_list_callback(update: Update, context: ContextTypes.DEFAULT_T
     # 預設：留在列表狀態
     return REMINDER_LIST
 
+# ========= 人員名單編輯：選單 & 新增 =========
+
 async def people_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """處理『人員名單編輯』選單相關 callback（不含刪除）。"""
+    """處理『人員名單編輯』選單相關 callback（新增 / 返回）。"""
     query = update.callback_query
     await query.answer()
     data = query.data
     chat_id = query.message.chat_id
 
-    # 從其他地方回到人員名單主選單
     if data in ("menu_people", "people_menu"):
         await send_people_menu(chat_id, context)
         return PEOPLE_MENU
@@ -404,22 +404,20 @@ async def people_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "請輸入要新增的 TG 名單，每行一位，格式為：\n"
             "    @TG_ID 暱稱\n"
             "例如：\n"
-            "    @tohu54520 豆腐\n"
-            "    @tohu51234 豆渣\n\n"
-            "你可以一次貼很多行，我會幫你批量新增。\n"
-            "若輸入完畢，請點下方「✅ 完成新增 / 返回」。"
+            "    @tohu12345 豆腐\n"
+            "    @tohu54321 島湖\n\n"
+            "你可以一次貼很多行，我會幫你批量新增。"
         )
         keyboard = [
-            [InlineKeyboardButton("✅ 完成新增 / 返回", callback_data="people_add_done")],
             [InlineKeyboardButton("⬅️ 返回人員名單編輯", callback_data="people_menu")],
         ]
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return PEOPLE_ADD
 
-    # 在新增模式按「完成新增 / 返回」
-    if data == "people_add_done":
-        await send_people_menu(chat_id, context)
-        return PEOPLE_MENU
+    # 點「刪除」：交給刪除流程
+    if data == "people_delete":
+        await people_delete_show_list(chat_id, context)
+        return PEOPLE_DELETE
 
     return PEOPLE_MENU
 
@@ -442,7 +440,6 @@ async def people_add_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         # 期待格式：@tgid 暱稱
         parts = line.split(maxsplit=1)
         if len(parts) != 2:
-            # 略過格式不正確的那幾行
             continue
         tg_id, nickname = parts
         if not tg_id.startswith("@"):
@@ -455,11 +452,14 @@ async def people_add_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     inserted = db_add_people_batch(chat_id, pairs)
 
+    detail_lines = "\n".join(f"    {tg} {nick}" for tg, nick in pairs)
+
     await update.message.reply_text(
-        f"✅ 已新增 {inserted} 筆名單。\n"
-        "若還要繼續新增，可以再貼一次名單。\n"
-        "若輸入完畢，請按「✅ 完成新增 / 返回」。"
+        f"✅ 已新增 {inserted} 筆名單。\n{detail_lines}"
     )
+
+    # 仍然停留在 PEOPLE_ADD，可以繼續貼更多；
+    # 若要結束，使用者可以點上方「⬅️ 返回人員名單編輯」。
     return PEOPLE_ADD
 
 # ========= 人員名單編輯：刪除 =========
@@ -530,7 +530,6 @@ async def people_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     return PEOPLE_DELETE
 
-
 # ========= 主選單 Callback =========
 
 async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -557,17 +556,17 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 所有提醒列表
         await send_reminder_list(chat_id, context)
         return REMINDER_LIST
+
     if data == "menu_people":
         await send_people_menu(chat_id, context)
         return PEOPLE_MENU
-        
+
     elif data.startswith("menu_"):
         # 其他主選單項目暫時先給個提示
         await query.message.reply_text("這個功能我還在幫你準備，之後再來試試看～")
         return MENU
 
     return MENU
-
 
 # ========= 一般提醒選單 Callback =========
 
@@ -603,7 +602,6 @@ async def general_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return SD_DATE
 
     return GENERAL_MENU
-
 
 # ========= 單一日期 flow：日期層 =========
 
@@ -648,7 +646,6 @@ async def single_date_got_date(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=markup,
     )
     return SD_TIME
-
 
 # ========= 單一日期 flow：時間層 =========
 
@@ -708,7 +705,6 @@ async def single_date_got_time(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=markup,
     )
     return SD_TEXT
-
 
 # ========= 單一日期 flow：內容層 =========
 
@@ -771,7 +767,6 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     return MENU
 
-
 # ========= Bot 啟動邏輯 =========
 
 async def run_bot():
@@ -793,44 +788,49 @@ async def run_bot():
                 .build()
             )
 
-            # ConversationHandler：包含整個主選單 + 一般提醒 ➜ 單一日期 flow + 提醒列表
             conv_handler = ConversationHandler(
                 entry_points=[CommandHandler("start", start)],
                 states={
-                     MENU: [
+                    MENU: [
                         CallbackQueryHandler(main_menu_callback),
                     ],
                     GENERAL_MENU: [
                         CallbackQueryHandler(general_menu_callback),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
                     SD_DATE: [
                         CallbackQueryHandler(back_from_date_to_general, pattern="^back_to_general$"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_date),
                     ],
                     SD_TIME: [
                         CallbackQueryHandler(back_from_time_to_date, pattern="^back_to_date$"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_time),
                     ],
                     SD_TEXT: [
                         CallbackQueryHandler(back_from_text_to_time, pattern="^back_to_time$"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_text),
                     ],
                     REMINDER_LIST: [
                         CallbackQueryHandler(reminder_list_callback),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
                     PEOPLE_MENU: [
-        # menu_people / people_menu / people_add / people_add_done / people_back_main
-                        CallbackQueryHandler(people_menu_callback, pattern="^menu_people$|^people_"),
+                        CallbackQueryHandler(people_menu_callback, pattern="^people_"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
                     PEOPLE_ADD: [
                         CallbackQueryHandler(people_menu_callback, pattern="^people_"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, people_add_got_text),
                     ],
                     PEOPLE_DELETE: [
                         CallbackQueryHandler(people_delete_callback, pattern="^people_"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
                 },
-
                 fallbacks=[CommandHandler("start", start)],
                 allow_reentry=True,
             )
@@ -863,7 +863,6 @@ async def run_bot():
             logger.exception("run_bot 發生未預期錯誤：%s", e)
             await asyncio.sleep(30)
 
-
 # ========= Background Worker 入口點 =========
 
 async def main():
@@ -874,4 +873,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
