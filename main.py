@@ -1,4 +1,9 @@
-+# Main entrypoint for the Telegram reminder bot
++"""Telegram reminder bot entrypoint.
++
++This module wires up command handlers and inline menus for scheduling
++group-specific reminders for various use cases (一般提醒、谷歌APK提醒、
++香港六合開獎等)。
++"""
 +import os
 +import asyncio
 +import logging
