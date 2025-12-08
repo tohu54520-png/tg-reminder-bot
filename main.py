@@ -10,19 +10,16 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ====== Logging 設定 ======
+# 從環境變數讀取 TG token & 時區
+TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
+TZ = os.getenv("TZ", "Asia/Taipei")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("main")
 
-# ====== 讀取環境變數 ======
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
-if not TG_BOT_TOKEN:
-    raise RuntimeError("環境變數 TG_BOT_TOKEN 未設定")
-
-# ====== 建立 FastAPI app，給 Render 用 ======
 app = FastAPI()
 
 
@@ -31,36 +28,58 @@ async def root():
     return {"status": "ok"}
 
 
-@app.get("/healthz")
-async def healthz():
-    # 給 Render 的 Health Check Path 用
-    return {"status": "healthy"}
+# ======== Telegram 指令 handler ========
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("嗨，我是你的提醒機器人～ ✅")
 
 
-# ====== Telegram Bot 指令處理 ======
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text("嗨，我已經在 Render 上運作囉！")
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("目前指令：/start /help")
 
 
-async def run_bot() -> None:
-    """建立並啟動 Telegram Bot（使用新版 run_polling）"""
+# ======== 啟動 Telegram Bot 的協程 ========
+
+async def run_bot():
+    logger.info("Building Telegram application...")
+
     application = (
         ApplicationBuilder()
         .token(TG_BOT_TOKEN)
         .build()
     )
 
+    # 加入指令 handler
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
 
-    logger.info("Starting Telegram bot polling...")
-    # 這邊在 python-telegram-bot 20.7 是同步函式，所以用 to_thread 跑在背景
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, application.run_polling)
+    # 用「非阻塞」的方式啟動 bot
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
 
+    logger.info("Telegram bot started (polling).")
+
+    # 讓這個 task 一直存活，直到服務被關閉
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        logger.info("Shutting down Telegram bot...")
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+        raise
+
+
+# ======== FastAPI 的啟動 / 關閉事件 ========
 
 @app.on_event("startup")
 async def on_startup():
-    # 用 background task 跑，不要阻塞 FastAPI
+    logger.info("Startup event: creating Telegram bot task.")
     asyncio.create_task(run_bot())
-    logger.info("Startup event: Telegram bot task created.")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logger.info("FastAPI app is shutting down.")
