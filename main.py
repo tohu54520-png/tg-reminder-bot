@@ -135,8 +135,9 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 一般提醒子選單
         keyboard = [
             [
-                InlineKeyboardButton("固定週期（尚未實作）", callback_data="general_cycle"),
+                # ✅ 1. 單一日期放左邊，固定週期右邊
                 InlineKeyboardButton("單一日期", callback_data="general_single"),
+                InlineKeyboardButton("固定週期（尚未實作）", callback_data="general_cycle"),
             ],
             [InlineKeyboardButton("⬅️ 返回主選單", callback_data="general_back")],
         ]
@@ -198,8 +199,9 @@ async def back_from_date_to_general(update: Update, context: ContextTypes.DEFAUL
 
     keyboard = [
         [
-            InlineKeyboardButton("固定週期（尚未實作）", callback_data="general_cycle"),
+            # ✅ 1. 這裡也要維持「單一日期」在左邊
             InlineKeyboardButton("單一日期", callback_data="general_single"),
+            InlineKeyboardButton("固定週期（尚未實作）", callback_data="general_cycle"),
         ],
         [InlineKeyboardButton("⬅️ 返回主選單", callback_data="general_back")],
     ]
@@ -225,8 +227,9 @@ async def single_date_got_date(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("⬅️ 修改日期", callback_data="back_to_date")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
+
+    # ✅ 2. 不再顯示「好的，日期已記錄為 12/08」
     await update.message.reply_text(
-        f"好的，日期已記錄為 {month:02d}/{day:02d}。\n"
         "請輸入時間四位數字（24小時制例如1701）。",
         reply_markup=markup,
     )
@@ -257,17 +260,12 @@ async def back_from_text_to_time(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    month, day = context.user_data.get("sd_date", (None, None))
-    if month is None or day is None:
-        # 萬一沒有日期，直接回到日期層
-        return await back_from_time_to_date(update, context)
-
+    # 即使有日期也不用再說「好的，日期已記錄為 ...」
     keyboard = [
         [InlineKeyboardButton("⬅️ 修改日期", callback_data="back_to_date")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
     await query.message.reply_text(
-        f"好的，日期已記錄為 {month:02d}/{day:02d}。\n"
         "請輸入時間四位數字（24小時制例如1701）。",
         reply_markup=markup,
     )
@@ -287,14 +285,13 @@ async def single_date_got_time(update: Update, context: ContextTypes.DEFAULT_TYP
     hour, minute = parsed
     context.user_data["sd_time"] = (hour, minute)
 
-    month, day = context.user_data.get("sd_date", (0, 0))
-
     keyboard = [
         [InlineKeyboardButton("⬅️ 修改時間", callback_data="back_to_time")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
+
+    # ✅ 3. 不再顯示「好的，時間已記錄為 12/08 17:06」
     await update.message.reply_text(
-        f"好的，時間已記錄為 {month:02d}/{day:02d} {hour:02d}:{minute:02d}。\n"
         "請輸入提醒內容。",
         reply_markup=markup,
     )
@@ -338,8 +335,8 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         name=f"single-{update.effective_chat.id}-{run_at.isoformat()}",
     )
 
-    # 提示完成
-    await update.message.reply_text(f"✅ 已記錄 {when_str} 提醒。")
+    # ✅ 4. 完成提示改成「已記錄 12/08 17:06 wm。」
+    await update.message.reply_text(f"已記錄 {when_str} {content}。")
 
     # 回到主選單
     await send_main_menu(
