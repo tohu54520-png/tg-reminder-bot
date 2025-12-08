@@ -25,7 +25,7 @@ from telegram.error import TimedOut
 # ========= 基本設定 =========
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
-TZ = ZoneInfo("Asia/Taipei")  # 預設時區
+TZ = ZoneInfo("Asia/Taipei")  # 預設時區（目前只用來算現在時間）
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -62,7 +62,8 @@ def parse_mmdd(text: str):
     month = int(text[:2])
     day = int(text[2:])
     try:
-        datetime(2000, month, day)  # 年份隨便給一個，只為了驗證是否合法
+        # 年份隨便給一個，只為了驗證日期是否合法
+        datetime(2000, month, day)
     except ValueError:
         return None
     return month, day
@@ -80,7 +81,11 @@ def parse_hhmm(text: str):
     return hour, minute
 
 
-async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str = "請選擇功能："):
+async def send_main_menu(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str = "請選擇功能：",
+):
     """發送主選單 Inline Keyboard。"""
     keyboard = [
         [InlineKeyboardButton("一般提醒", callback_data="menu_general")],
@@ -135,7 +140,7 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 一般提醒子選單
         keyboard = [
             [
-                # ✅ 1. 單一日期放左邊，固定週期右邊
+                # ✅ 單一日期在左邊，固定週期在右邊
                 InlineKeyboardButton("單一日期", callback_data="general_single"),
                 InlineKeyboardButton("固定週期（尚未實作）", callback_data="general_cycle"),
             ],
@@ -199,7 +204,6 @@ async def back_from_date_to_general(update: Update, context: ContextTypes.DEFAUL
 
     keyboard = [
         [
-            # ✅ 1. 這裡也要維持「單一日期」在左邊
             InlineKeyboardButton("單一日期", callback_data="general_single"),
             InlineKeyboardButton("固定週期（尚未實作）", callback_data="general_cycle"),
         ],
@@ -228,7 +232,6 @@ async def single_date_got_date(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     markup = InlineKeyboardMarkup(keyboard)
 
-    # ✅ 2. 不再顯示「好的，日期已記錄為 12/08」
     await update.message.reply_text(
         "請輸入時間四位數字（24小時制例如1701）。",
         reply_markup=markup,
@@ -260,7 +263,6 @@ async def back_from_text_to_time(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    # 即使有日期也不用再說「好的，日期已記錄為 ...」
     keyboard = [
         [InlineKeyboardButton("⬅️ 修改日期", callback_data="back_to_date")],
     ]
@@ -290,7 +292,6 @@ async def single_date_got_time(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     markup = InlineKeyboardMarkup(keyboard)
 
-    # ✅ 3. 不再顯示「好的，時間已記錄為 12/08 17:06」
     await update.message.reply_text(
         "請輸入提醒內容。",
         reply_markup=markup,
@@ -301,7 +302,10 @@ async def single_date_got_time(update: Update, context: ContextTypes.DEFAULT_TYP
 # ========= 單一日期 flow：內容層 =========
 
 async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """收到提醒內容，建立排程（不顯示內容本身，避免洗頻）"""
+    """
+    收到提醒內容，建立排程。
+    最後只顯示「已記錄 MM/DD HH:MM 提醒」，不把內容印出，避免洗頻。
+    """
     content = (update.message.text or "").strip()
     if not content:
         await update.message.reply_text("提醒內容不能是空的，請再輸入一次。")
@@ -310,43 +314,48 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     month, day = context.user_data.get("sd_date", (None, None))
     hour, minute = context.user_data.get("sd_time", (None, None))
 
-    if month is None or day is None or hour is None or minute is None:
+    if None in (month, day, hour, minute):
         await update.message.reply_text("內部資料遺失，請重新從 /start 開始設定一次 🙏")
         return MENU
 
-    # ✅ 使用「沒有 tzinfo 的 datetime」，避免 JobQueue 出錯
-    now = datetime.now()
+    # 使用系統現在時間，只取年份
+    now = datetime.now(TZ)
     year = now.year
-    run_at = datetime(year, month, day, hour, minute)
 
-    if run_at <= now:
+    # 建立「下一次」要提醒的時間；如果今天已過，就 +1 年
+    run_at = datetime(year, month, day, hour, minute)
+    if run_at <= now.replace(tzinfo=None):
         run_at = datetime(year + 1, month, day, hour, minute)
 
     when_str = run_at.strftime("%m/%d %H:%M")
 
-    # ✅ 建立提醒 Job
-    context.job_queue.run_once(
-        reminder_job,
-        when=run_at,
-        data={
-            "chat_id": update.effective_chat.id,
-            "text": content,
-            "when_str": when_str,
-        },
-        name=f"single-{update.effective_chat.id}-{run_at.isoformat()}",
-    )
+    # 建立提醒 Job（加 try/except，避免失敗時整個 handler 掛掉）
+    try:
+        context.job_queue.run_once(
+            reminder_job,
+            when=run_at,
+            data={
+                "chat_id": update.effective_chat.id,
+                "text": content,
+                "when_str": when_str,
+            },
+            name=f"single-{update.effective_chat.id}-{run_at.isoformat()}",
+        )
+    except Exception as e:
+        logger.exception("建立單一日期提醒 job 失敗: %s", e)
+        await update.message.reply_text("建立提醒時發生錯誤，麻煩稍後再試一次 🙏")
+        return MENU
 
-    # ✅【這一行就是你要的最終顯示格式】
+    # ✅ 這句就是你要的最終提示
     await update.message.reply_text(f"✅ 已記錄 {when_str} 提醒")
 
-    # ✅ 回主選單
+    # 回主選單
     await send_main_menu(
         update.effective_chat.id,
         context,
         "還需要我幫你設什麼提醒嗎？",
     )
     return MENU
-
 
 
 # ========= Bot 啟動邏輯 =========
@@ -381,16 +390,34 @@ async def run_bot():
                         CallbackQueryHandler(general_menu_callback),
                     ],
                     SD_DATE: [
-                        CallbackQueryHandler(back_from_date_to_general, pattern="^back_to_general$"),
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_date),
+                        CallbackQueryHandler(
+                            back_from_date_to_general,
+                            pattern="^back_to_general$",
+                        ),
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND,
+                            single_date_got_date,
+                        ),
                     ],
                     SD_TIME: [
-                        CallbackQueryHandler(back_from_time_to_date, pattern="^back_to_date$"),
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_time),
+                        CallbackQueryHandler(
+                            back_from_time_to_date,
+                            pattern="^back_to_date$",
+                        ),
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND,
+                            single_date_got_time,
+                        ),
                     ],
                     SD_TEXT: [
-                        CallbackQueryHandler(back_from_text_to_time, pattern="^back_to_time$"),
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_text),
+                        CallbackQueryHandler(
+                            back_from_text_to_time,
+                            pattern="^back_to_time$",
+                        ),
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND,
+                            single_date_got_text,
+                        ),
                     ],
                 },
                 fallbacks=[CommandHandler("start", start)],
@@ -437,4 +464,3 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("FastAPI app is shutting down.")
-
