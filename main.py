@@ -43,7 +43,10 @@ logger = logging.getLogger("main")
     SD_TIME,              # 單一日期：輸入時間
     SD_TEXT,              # 單一日期：輸入內容
     REMINDER_LIST,        # 所有提醒列表
-) = range(6)
+    PEOPLE_MENU,          # 人員名單編輯：選單
+    PEOPLE_ADD,           # 人員名單編輯：新增
+    PEOPLE_DELETE,        # 人員名單編輯：刪除
+) = range(9)
 
 # ========= SQLite 工具 =========
 
@@ -51,6 +54,8 @@ def init_db():
     """初始化 SQLite 資料庫。"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    # 提醒表：一般提醒 / APK / 六合彩
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS reminders (
@@ -62,6 +67,19 @@ def init_db():
         )
         """
     )
+
+    # 人員名單表：可被 @ 的人
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS people (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id  INTEGER NOT NULL,
+            tg_id    TEXT    NOT NULL,   -- 例如 @tohu54520
+            nickname TEXT    NOT NULL    -- 例如 豆腐
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
     logger.info("DB initialized.")
@@ -110,7 +128,48 @@ def db_delete_reminder(reminder_id: int):
     cur.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
     conn.commit()
     conn.close()
+    
+def db_list_people(chat_id: int):
+    """列出某個聊天室目前所有可 @ 的人員名單。"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, tg_id, nickname FROM people WHERE chat_id=? ORDER BY id ASC",
+        (chat_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
+
+def db_add_people_batch(chat_id: int, pairs: list[tuple[str, str]]) -> int:
+    """
+    批次新增多筆人員名單。
+    pairs: List[(tg_id, nickname)]
+    回傳實際新增的筆數。
+    """
+    if not pairs:
+        return 0
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.executemany(
+        "INSERT INTO people (chat_id, tg_id, nickname) VALUES (?, ?, ?)",
+        [(chat_id, tg, nick) for tg, nick in pairs],
+    )
+    inserted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def db_delete_person(person_id: int):
+    """刪除單一人員名單。"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM people WHERE id=?", (person_id,))
+    conn.commit()
+    conn.close()
 
 # ========= 小工具 =========
 
@@ -157,6 +216,22 @@ async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text:
     ]
     markup = InlineKeyboardMarkup(keyboard)
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+
+async def send_people_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """發送【人員名單編輯】子選單。"""
+    keyboard = [
+        [
+            InlineKeyboardButton("新增", callback_data="people_add"),
+            InlineKeyboardButton("刪除", callback_data="people_delete"),
+        ],
+        [InlineKeyboardButton("⬅️ 返回主選單", callback_data="people_back_main")],
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="【人員名單編輯】請選擇操作：",
+        reply_markup=markup,
+    )
 
 
 # ========= JobQueue：提醒任務 =========
@@ -306,6 +381,155 @@ async def reminder_list_callback(update: Update, context: ContextTypes.DEFAULT_T
     # 預設：留在列表狀態
     return REMINDER_LIST
 
+async def people_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """處理『人員名單編輯』選單相關 callback（不含刪除）。"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat_id
+
+    # 從其他地方回到人員名單主選單
+    if data in ("menu_people", "people_menu"):
+        await send_people_menu(chat_id, context)
+        return PEOPLE_MENU
+
+    if data == "people_back_main":
+        await send_main_menu(chat_id, context)
+        return MENU
+
+    # 進入「新增」模式
+    if data == "people_add":
+        text = (
+            "【人員名單編輯 ➜ 新增】\n"
+            "請輸入要新增的 TG 名單，每行一位，格式為：\n"
+            "    @TG_ID 暱稱\n"
+            "例如：\n"
+            "    @tohu54520 豆腐\n"
+            "    @tohu51234 豆渣\n\n"
+            "你可以一次貼很多行，我會幫你批量新增。\n"
+            "若輸入完畢，請點下方「✅ 完成新增 / 返回」。"
+        )
+        keyboard = [
+            [InlineKeyboardButton("✅ 完成新增 / 返回", callback_data="people_add_done")],
+            [InlineKeyboardButton("⬅️ 返回人員名單編輯", callback_data="people_menu")],
+        ]
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return PEOPLE_ADD
+
+    # 在新增模式按「完成新增 / 返回」
+    if data == "people_add_done":
+        await send_people_menu(chat_id, context)
+        return PEOPLE_MENU
+
+    return PEOPLE_MENU
+
+
+async def people_add_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    在 PEOPLE_ADD 狀態下收到文字：
+    解析使用者貼上的多行 @TG_ID 暱稱，直接寫入 DB。
+    """
+    chat_id = update.effective_chat.id
+    raw = (update.message.text or "").strip()
+    if not raw:
+        await update.message.reply_text("內容是空的，請輸入 @TG_ID 暱稱，每行一位。")
+        return PEOPLE_ADD
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    pairs: list[tuple[str, str]] = []
+
+    for line in lines:
+        # 期待格式：@tgid 暱稱
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            # 略過格式不正確的那幾行
+            continue
+        tg_id, nickname = parts
+        if not tg_id.startswith("@"):
+            continue
+        pairs.append((tg_id, nickname.strip()))
+
+    if not pairs:
+        await update.message.reply_text("沒有找到合法的『@TG_ID 暱稱』格式，請再試一次。")
+        return PEOPLE_ADD
+
+    inserted = db_add_people_batch(chat_id, pairs)
+
+    await update.message.reply_text(
+        f"✅ 已新增 {inserted} 筆名單。\n"
+        "若還要繼續新增，可以再貼一次名單。\n"
+        "若輸入完畢，請按「✅ 完成新增 / 返回」。"
+    )
+    return PEOPLE_ADD
+
+# ========= 人員名單編輯：刪除 =========
+
+async def people_delete_show_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """顯示目前所有人員名單，讓使用者點選刪除。"""
+    rows = db_list_people(chat_id)
+    if not rows:
+        keyboard = [
+            [InlineKeyboardButton("⬅️ 返回人員名單編輯", callback_data="people_menu")],
+            [InlineKeyboardButton("⬅️ 返回主選單", callback_data="people_back_main")],
+        ]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="【人員名單編輯 ➜ 刪除】\n目前沒有任何名單可以刪除～",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    keyboard = []
+    for pid, tg_id, nickname in rows:
+        label = f"{nickname} {tg_id}"
+        keyboard.append(
+            [InlineKeyboardButton(label, callback_data=f"people_del_{pid}")]
+        )
+
+    keyboard.append(
+        [InlineKeyboardButton("⬅️ 返回人員名單編輯", callback_data="people_menu")]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("⬅️ 返回主選單", callback_data="people_back_main")]
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="【人員名單編輯 ➜ 刪除】\n請點選要刪除的人員：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def people_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """處理刪除名單相關的 callback。"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat_id
+
+    if data == "people_delete":
+        # 從選單進來：顯示列表
+        await people_delete_show_list(chat_id, context)
+        return PEOPLE_DELETE
+
+    if data == "people_menu":
+        await send_people_menu(chat_id, context)
+        return PEOPLE_MENU
+
+    if data == "people_back_main":
+        await send_main_menu(chat_id, context)
+        return MENU
+
+    if data.startswith("people_del_"):
+        pid = int(data.split("_")[-1])
+        db_delete_person(pid)
+        await query.message.reply_text("✅ 已刪除這位人員。")
+        # 刪完後重新顯示列表
+        await people_delete_show_list(chat_id, context)
+        return PEOPLE_DELETE
+
+    return PEOPLE_DELETE
+
 
 # ========= 主選單 Callback =========
 
@@ -333,7 +557,10 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 所有提醒列表
         await send_reminder_list(chat_id, context)
         return REMINDER_LIST
-
+    if data == "menu_people":
+        await send_people_menu(chat_id, context)
+        return PEOPLE_MENU
+        
     elif data.startswith("menu_"):
         # 其他主選單項目暫時先給個提示
         await query.message.reply_text("這個功能我還在幫你準備，之後再來試試看～")
@@ -570,7 +797,7 @@ async def run_bot():
             conv_handler = ConversationHandler(
                 entry_points=[CommandHandler("start", start)],
                 states={
-                    MENU: [
+                     MENU: [
                         CallbackQueryHandler(main_menu_callback),
                     ],
                     GENERAL_MENU: [
@@ -591,7 +818,19 @@ async def run_bot():
                     REMINDER_LIST: [
                         CallbackQueryHandler(reminder_list_callback),
                     ],
+                    PEOPLE_MENU: [
+        # menu_people / people_menu / people_add / people_add_done / people_back_main
+                        CallbackQueryHandler(people_menu_callback, pattern="^menu_people$|^people_"),
+                    ],
+                    PEOPLE_ADD: [
+                        CallbackQueryHandler(people_menu_callback, pattern="^people_"),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, people_add_got_text),
+                    ],
+                    PEOPLE_DELETE: [
+                        CallbackQueryHandler(people_delete_callback, pattern="^people_"),
+                    ],
                 },
+
                 fallbacks=[CommandHandler("start", start)],
                 allow_reentry=True,
             )
@@ -635,3 +874,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
