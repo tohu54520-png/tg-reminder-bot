@@ -1,4 +1,6 @@
-aiogram==3.4.1
-fastapi==0.110.0
-uvicorn==0.30.0
-python-dotenv==1.0.1
+python-telegram-bot==20.7
+fastapi
+uvicorn
+python-dotenv
+pytz
+requests
