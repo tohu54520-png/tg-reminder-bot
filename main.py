@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -37,19 +37,21 @@ logger = logging.getLogger("main")
 
 # Conversation 狀態
 (
-    MENU,                 # 主選單
-    GENERAL_MENU,         # 一般提醒選單
-    SD_DATE,              # 單一日期：輸入日期
-    SD_TIME,              # 單一日期：輸入時間
-    SD_TEXT,              # 單一日期：輸入內容
-    REMINDER_LIST,        # 所有提醒列表
-    PEOPLE_MENU,          # 人員名單編輯：選單
-    PEOPLE_ADD,           # 人員名單編輯：新增
-    PEOPLE_DELETE,        # 人員名單編輯：刪除
-    APK_WEEKDAY,          # APK 提醒：選擇每週幾
-    APK_TIME,             # APK 提醒：輸入時間
-    APK_TEXT,             # APK 提醒：輸入內容
-) = range(12)
+    MENU,
+    GENERAL_MENU,
+    SD_DATE,
+    SD_TIME,
+    SD_TEXT,
+    REMINDER_LIST,
+    PEOPLE_MENU,
+    PEOPLE_ADD,
+    PEOPLE_DELETE,
+
+    APK_WEEKDAY,     # 選星期
+    APK_TIME,        # 選時間 HHMM
+    APK_TEXT,        # 輸入內容
+    APK_TAG_PEOPLE,  # 選 @ 人
+) = range(13)
 
 
 # ========= SQLite 工具 =========
@@ -147,7 +149,7 @@ def db_list_people(chat_id: int):
     return rows
 
 
-def db_add_people_batch(chat_id: int, pairs):
+def db_add_people_batch(chat_id: int, pairs: list[tuple[str, str]]) -> int:
     """
     批次新增多筆人員名單。
     pairs: List[(tg_id, nickname)]
@@ -175,7 +177,6 @@ def db_delete_person(person_id: int):
     cur.execute("DELETE FROM people WHERE id=?", (person_id,))
     conn.commit()
     conn.close()
-
 
 # ========= 小工具 =========
 
@@ -211,40 +212,6 @@ def format_ts(ts: int) -> str:
     return dt.strftime("%m/%d %H:%M")
 
 
-def build_apk_weekday_keyboard(selected):
-    """
-    建立 APK 每週幾選單的 keyboard。
-    selected: set[int] 0=一, 6=日
-    """
-    names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
-    buttons = []
-    # 排成 3 + 3 + 1
-    rows_idx = [
-        [0, 1, 2],
-        [3, 4, 5],
-        [6],
-    ]
-    for row in rows_idx:
-        row_btns = []
-        for idx in row:
-            label = names[idx]
-            if idx in selected:
-                label = "✅ " + label
-            row_btns.append(
-                InlineKeyboardButton(label, callback_data=f"apk_wd_{idx}")
-            )
-        buttons.append(row_btns)
-
-    buttons.append(
-        [InlineKeyboardButton("下一步：設定時間", callback_data="apk_next_time")]
-    )
-    buttons.append(
-        [InlineKeyboardButton("⬅️ 返回主選單", callback_data="apk_back_main")]
-    )
-
-    return InlineKeyboardMarkup(buttons)
-
-
 async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str = "請選擇功能："):
     """發送主選單 Inline Keyboard。"""
     keyboard = [
@@ -273,85 +240,243 @@ async def send_people_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         text="【人員名單編輯】請選擇操作：",
         reply_markup=markup,
     )
+# ========= 谷歌 APK 提醒：選擇星期（可複選） =========
+
+def build_weekday_keyboard(selected: set[int]):
+    labels = ["一", "二", "三", "四", "五", "六", "日"]
+    keyboard = []
+    row = []
+
+    for i in range(7):
+        mark = "✅" if i in selected else "⬜"
+        row.append(
+            InlineKeyboardButton(
+                f"{mark} 週{labels[i]}",
+                callback_data=f"apk_wd_{i}",
+            )
+        )
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([
+        InlineKeyboardButton("➡️ 下一步（選時間）", callback_data="apk_wd_next"),
+        InlineKeyboardButton("⬅️ 返回主選單", callback_data="apk_wd_back"),
+    ])
+
+    return InlineKeyboardMarkup(keyboard)
 
 
-async def send_apk_weekday_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """發送【谷歌APK提醒】的每週幾選單。"""
+async def apk_weekday_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
     selected = context.user_data.get("apk_weekdays", set())
-    if not isinstance(selected, set):
-        selected = set()
-        context.user_data["apk_weekdays"] = selected
 
-    markup = build_apk_weekday_keyboard(selected)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="【谷歌APK提醒】\n請選擇每週要提醒的星期（可複選）：",
-        reply_markup=markup,
+    await query.message.reply_text(
+        "【谷歌 APK 提醒】\n請選擇每週要提醒的「星期」（可複選）：",
+        reply_markup=build_weekday_keyboard(selected),
     )
+
+    return APK_WEEKDAY
+
+
+async def apk_weekday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat_id
+
+    selected = context.user_data.setdefault("apk_weekdays", set())
+
+    if data.startswith("apk_wd_") and data[-1].isdigit():
+        wd = int(data[-1])
+        if wd in selected:
+            selected.remove(wd)
+        else:
+            selected.add(wd)
+
+        await query.message.edit_reply_markup(
+            reply_markup=build_weekday_keyboard(selected)
+        )
+        return APK_WEEKDAY
+
+    if data == "apk_wd_next":
+        if not selected:
+            await query.message.reply_text("⚠️ 請至少選擇一天星期。")
+            return APK_WEEKDAY
+
+        await query.message.reply_text(
+            "請輸入提醒時間（HHMM，例如：0930 或 1830）："
+        )
+        return APK_TIME
+
+    if data == "apk_wd_back":
+        await send_main_menu(chat_id, context)
+        return MENU
+
+    return APK_WEEKDAY
+# ========= 谷歌 APK 提醒：輸入時間 =========
+
+async def apk_time_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    parsed = parse_hhmm(text)
+    if not parsed:
+        await update.message.reply_text("時間格式錯誤，請輸入 HHMM，例如 0930 或 1830")
+        return APK_TIME
+
+    context.user_data["apk_time"] = parsed
+    await update.message.reply_text("請輸入提醒內容（例如：本週 APK 更新請記錄）：")
+    return APK_TEXT
+
+
+# ========= 谷歌 APK 提醒：輸入內容 =========
+
+async def apk_text_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("提醒內容不能為空，請重新輸入。")
+        return APK_TEXT
+
+    context.user_data["apk_text"] = text
+
+    # 讓使用者選擇是否要 @ 人員
+    people = db_list_people(update.effective_chat.id)
+    if not people:
+        context.user_data["apk_mentions"] = []
+        await finalize_apk_schedule(update, context)
+        return MENU
+
+    keyboard = []
+    for pid, tg_id, nickname in people:
+        keyboard.append([
+            InlineKeyboardButton(f"{nickname} {tg_id}", callback_data=f"apk_at_{pid}")
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("✅ 不 @ 任何人，直接完成", callback_data="apk_at_done")
+    ])
+
+    await update.message.reply_text(
+        "請選擇要 @ 的人（可複選，選完點 ✅ 完成）：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+    context.user_data["apk_mentions"] = set()
+    return APK_TEXT
+
+
+# ========= 谷歌 APK 提醒：選擇 @ 人員 =========
+
+async def apk_at_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    mentions = context.user_data.setdefault("apk_mentions", set())
+
+    if data.startswith("apk_at_"):
+        pid = int(data.split("_")[-1])
+        if pid in mentions:
+            mentions.remove(pid)
+        else:
+            mentions.add(pid)
+
+        return APK_TEXT
+
+    if data == "apk_at_done":
+        await finalize_apk_schedule(update, context)
+        return MENU
+
+
+# ========= 核心：建立 APK 提醒排程 =========
+
+async def finalize_apk_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    weekdays = context.user_data.get("apk_weekdays", set())
+    hour, minute = context.user_data.get("apk_time")
+    text = context.user_data.get("apk_text")
+    mention_ids = context.user_data.get("apk_mentions", set())
+
+    mentions = []
+    if mention_ids:
+        people = db_list_people(chat_id)
+        for pid, tg_id, nickname in people:
+            if pid in mention_ids:
+                mentions.append(tg_id)
+
+    mention_str = "\n".join(mentions)
+
+    now = datetime.now(TZ)
+    labels = ["一", "二", "三", "四", "五", "六", "日"]
+
+    created = 0
+
+    for wd in weekdays:
+        # 計算下一個符合的星期
+        days_ahead = (wd - now.weekday()) % 7
+        run_at = datetime(
+            now.year, now.month, now.day, hour, minute, tzinfo=TZ
+        ) + timedelta(days=days_ahead)
+
+        if run_at <= now:
+            run_at += timedelta(days=7)
+
+        mmdd = run_at.strftime("%m/%d")
+        label = labels[wd]
+
+        final_text = f"【{mmdd}】【谷歌】【PROD】本周{label}APK更新-紀錄單\n{text}"
+        if mention_str:
+            final_text += f"\n{mention_str}"
+
+        reminder_id = db_add_reminder(chat_id, "apk", run_at, final_text)
+
+        job_name = f"apk-{reminder_id}_{wd}"
+        context.application.job_queue.run_once(
+            reminder_job,
+            when=run_at,
+            data={
+                "chat_id": chat_id,
+                "text": final_text,
+                "when_str": mmdd,
+                "reminder_id": reminder_id,
+            },
+            name=job_name,
+        )
+
+        created += 1
+
+    await update.effective_chat.send_message(
+        f"✅ 已建立 {created} 個 APK 每週提醒"
+    )
+
+    # 清空暫存
+    context.user_data.pop("apk_weekdays", None)
+    context.user_data.pop("apk_time", None)
+    context.user_data.pop("apk_text", None)
+    context.user_data.pop("apk_mentions", None)
+
+    await send_main_menu(chat_id, context)
 
 
 # ========= JobQueue：提醒任務 =========
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data or {}
-    chat_id = data.get("chat_id")
-    when_str = data.get("when_str", "")
+    data = context.job.data
+    chat_id = data["chat_id"]
+    text = data["text"]
+    when_str = data["when_str"]
     reminder_id = data.get("reminder_id")
 
-    kind = None
-    run_at_ts = None
-    db_text = None
-
-    if reminder_id is not None:
-        row = db_get_reminder(reminder_id)
-        if row:
-            _id, chat_id_db, kind, run_at_ts, db_text = row
-            # 以 DB 裡的 chat_id 為主
-            chat_id = chat_id_db or chat_id
-
-    # 構造要送出的文字
-    final_text = ""
-    if kind == "apk" and run_at_ts is not None:
-        dt = datetime.fromtimestamp(run_at_ts, TZ)
-        mmdd = dt.strftime("%m/%d")
-        weekday_index = dt.weekday()  # 0=一 ... 6=日
-        zh_week = ["一", "二", "三", "四", "五", "六", "日"][weekday_index]
-        prefix = f"【谷歌】【PROD】本周{zh_week}APK更新-紀錄單"
-        if db_text:
-            final_text = f"{prefix}\n{db_text}"
-        else:
-            final_text = prefix
-    else:
-        # 一般提醒或沒有 kind 資訊，就直接用 DB 內容或 data.text
-        final_text = db_text or data.get("text", f"⏰ 提醒時間到囉（{when_str}）")
-
-    if chat_id is None:
-        logger.warning("reminder_job: chat_id 為 None，略過發送。")
-        return
-
-    await context.bot.send_message(chat_id=chat_id, text=final_text)
-
-    # 若是 APK 提醒，建立下一週同時間的提醒（週期性）
-    if reminder_id is not None and kind == "apk" and run_at_ts is not None:
-        old_dt = datetime.fromtimestamp(run_at_ts, TZ)
-        next_dt = old_dt + timedelta(days=7)
-
-        try:
-            next_id = db_add_reminder(chat_id, "apk", next_dt, db_text or "")
-            next_when_str = next_dt.strftime("%m/%d %H:%M")
-
-            context.application.job_queue.run_once(
-                reminder_job,
-                when=next_dt.astimezone(TZ),
-                data={
-                    "chat_id": chat_id,
-                    "when_str": next_when_str,
-                    "reminder_id": next_id,
-                },
-                name=f"reminder-{next_id}",
-            )
-        except Exception as e:
-            logger.exception("建立下一週 APK 提醒失敗：%s", e)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"⏰ 提醒時間到囉（{when_str}）：\n{text}",
+    )
 
     # Job 執行完，把這筆提醒從 DB 刪掉（如果還在）
     if reminder_id is not None:
@@ -359,7 +484,6 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             db_delete_reminder(reminder_id)
         except Exception as e:
             logger.warning("刪除提醒（ID=%s）時發生錯誤：%s", reminder_id, e)
-
 
 # ========= 指令處理 =========
 
@@ -376,7 +500,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("目前指令：\n/start - 主選單\n/help - 顯示這個說明")
-
 
 # ========= 所有提醒列表 =========
 
@@ -486,17 +609,15 @@ async def reminder_list_callback(update: Update, context: ContextTypes.DEFAULT_T
     # 預設：留在列表狀態
     return REMINDER_LIST
 
-
-# ========= 人員名單編輯 =========
+# ========= 人員名單編輯：選單 & 新增 =========
 
 async def people_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """處理『人員名單編輯』選單相關 callback（不含刪除列表內點選）。"""
+    """處理『人員名單編輯』選單相關 callback（新增 / 返回）。"""
     query = update.callback_query
     await query.answer()
     data = query.data
     chat_id = query.message.chat_id
 
-    # 從其他地方回到人員名單主選單
     if data in ("menu_people", "people_menu"):
         await send_people_menu(chat_id, context)
         return PEOPLE_MENU
@@ -522,6 +643,11 @@ async def people_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return PEOPLE_ADD
 
+    # 點「刪除」：交給刪除流程
+    if data == "people_delete":
+        await people_delete_show_list(chat_id, context)
+        return PEOPLE_DELETE
+
     return PEOPLE_MENU
 
 
@@ -537,13 +663,12 @@ async def people_add_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return PEOPLE_ADD
 
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    pairs = []
+    pairs: list[tuple[str, str]] = []
 
     for line in lines:
         # 期待格式：@tgid 暱稱
         parts = line.split(maxsplit=1)
         if len(parts) != 2:
-            # 略過格式不正確的那幾行
             continue
         tg_id, nickname = parts
         if not tg_id.startswith("@"):
@@ -556,14 +681,17 @@ async def people_add_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     inserted = db_add_people_batch(chat_id, pairs)
 
-    lines_out = [f"✅ 已新增 {inserted} 筆名單。"]
-    for tg, nick in pairs:
-        lines_out.append(f"    {tg} {nick}")
+    detail_lines = "\n".join(f"    {tg} {nick}" for tg, nick in pairs)
 
-    await update.message.reply_text("\n".join(lines_out))
-    # 保持在 PEOPLE_ADD 狀態，可以繼續貼下一批，或按「返回人員名單編輯」
+    await update.message.reply_text(
+        f"✅ 已新增 {inserted} 筆名單。\n{detail_lines}"
+    )
+
+    # 仍然停留在 PEOPLE_ADD，可以繼續貼更多；
+    # 若要結束，使用者可以點上方「⬅️ 返回人員名單編輯」。
     return PEOPLE_ADD
 
+# ========= 人員名單編輯：刪除 =========
 
 async def people_delete_show_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """顯示目前所有人員名單，讓使用者點選刪除。"""
@@ -631,190 +759,6 @@ async def people_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     return PEOPLE_DELETE
 
-
-# ========= APK 提醒 Flow =========
-
-async def apk_weekday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """處理 APK 提醒：選擇每週幾的 callback。"""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    chat_id = query.message.chat_id
-
-    selected = context.user_data.get("apk_weekdays", set())
-    if not isinstance(selected, set):
-        selected = set()
-        context.user_data["apk_weekdays"] = selected
-
-    if data == "apk_back_main":
-        await send_main_menu(chat_id, context)
-        return MENU
-
-    if data.startswith("apk_wd_"):
-        idx = int(data.split("_")[-1])
-        if idx in selected:
-            selected.remove(idx)
-        else:
-            selected.add(idx)
-
-        # 重新發一次選單（簡單做法：新訊息，不改舊訊息）
-        markup = build_apk_weekday_keyboard(selected)
-        await query.message.reply_text(
-            "【谷歌APK提醒】\n請選擇每週要提醒的星期（可複選）：",
-            reply_markup=markup,
-        )
-        return APK_WEEKDAY
-
-    if data == "apk_next_time":
-        if not selected:
-            # 至少要選一個星期
-            await query.answer("請至少勾選一個星期。", show_alert=True)
-            return APK_WEEKDAY
-
-        # 進入輸入時間
-        keyboard = [
-            [InlineKeyboardButton("⬅️ 返回選擇星期", callback_data="apk_back_weekday")],
-        ]
-        await query.message.reply_text(
-            "請輸入時間四位數字（24小時制例如1701）。",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return APK_TIME
-
-    return APK_WEEKDAY
-
-
-async def apk_back_to_weekday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """從時間層回到選擇每週幾。"""
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    await send_apk_weekday_menu(chat_id, context)
-    return APK_WEEKDAY
-
-
-async def apk_got_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """APK 提醒：收到 HHMM。"""
-    text = update.message.text.strip()
-    parsed = parse_hhmm(text)
-    if not parsed:
-        await update.message.reply_text(
-            "時間格式有誤，請輸入四位數字（24小時制），例如 1701。"
-        )
-        return APK_TIME
-
-    hour, minute = parsed
-    context.user_data["apk_time"] = (hour, minute)
-
-    keyboard = [
-        [InlineKeyboardButton("⬅️ 修改時間", callback_data="apk_back_time")],
-    ]
-    await update.message.reply_text(
-        "請輸入提醒內容。",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return APK_TEXT
-
-
-async def apk_back_to_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """從內容層回到輸入時間。"""
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = [
-        [InlineKeyboardButton("⬅️ 返回選擇星期", callback_data="apk_back_weekday")],
-    ]
-    await query.message.reply_text(
-        "請輸入時間四位數字（24小時制例如1701）。",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return APK_TIME
-
-
-def calc_next_datetime_for_weekday(target_wd: int, hour: int, minute: int) -> datetime:
-    """
-    計算「從現在開始」下一次落在指定 weekday + 時間的 datetime。
-    target_wd: 0=週一 ... 6=週日
-    """
-    now = datetime.now(TZ)
-    today_wd = now.weekday()  # 0=週一
-    days_ahead = (target_wd - today_wd) % 7
-
-    candidate = datetime(
-        now.year, now.month, now.day, hour, minute, tzinfo=TZ
-    ) + timedelta(days=days_ahead)
-
-    if candidate <= now:
-        candidate += timedelta(days=7)
-
-    return candidate
-
-
-async def apk_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """APK 提醒：收到自訂提醒內容，建立排程（週期性，每週一次）。"""
-    chat_id = update.effective_chat.id
-    content = (update.message.text or "").strip()
-    if not content:
-        await update.message.reply_text("提醒內容不能是空的，請再輸入一次。")
-        return APK_TEXT
-
-    weekdays = context.user_data.get("apk_weekdays", set())
-    if not weekdays:
-        await update.message.reply_text("內部資料遺失（未選擇星期），請重新從 /start 開始設定一次 🙏")
-        return MENU
-
-    hour_min = context.user_data.get("apk_time")
-    if not hour_min:
-        await update.message.reply_text("內部資料遺失（未設定時間），請重新從 /start 開始設定一次 🙏")
-        return MENU
-
-    hour, minute = hour_min
-
-    created_times = []
-
-    for wd in sorted(weekdays):
-        run_at = calc_next_datetime_for_weekday(wd, hour, minute)
-        when_str = run_at.strftime("%m/%d %H:%M")
-
-        try:
-            reminder_id = db_add_reminder(chat_id, "apk", run_at, content)
-            job_name = f"reminder-{reminder_id}"
-
-            context.application.job_queue.run_once(
-                reminder_job,
-                when=run_at.astimezone(TZ),
-                data={
-                    "chat_id": chat_id,
-                    "when_str": when_str,
-                    "reminder_id": reminder_id,
-                },
-                name=job_name,
-            )
-            created_times.append(when_str)
-        except Exception as e:
-            logger.exception("建立 APK 提醒 job 失敗：%s", e)
-
-    if created_times:
-        lines = ["✅ 已建立以下 APK 提醒（每週循環）："]
-        for t in created_times:
-            lines.append(f" - {t}")
-        await update.message.reply_text("\n".join(lines))
-    else:
-        await update.message.reply_text("建立 APK 提醒時發生錯誤，麻煩稍後再試一次 🙏")
-
-    # 清掉暫存
-    context.user_data.pop("apk_weekdays", None)
-    context.user_data.pop("apk_time", None)
-
-    # 回主選單
-    await send_main_menu(
-        chat_id,
-        context,
-        "還需要我幫你設什麼提醒嗎？",
-    )
-    return MENU
-
-
 # ========= 主選單 Callback =========
 
 async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -845,12 +789,10 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "menu_people":
         await send_people_menu(chat_id, context)
         return PEOPLE_MENU
-
+        
     if data == "menu_apk":
-        # 進入 APK 提醒 flow：先選每週幾
-        context.user_data["apk_weekdays"] = set()
-        context.user_data.pop("apk_time", None)
-        await send_apk_weekday_menu(chat_id, context)
+        context.user_data.pop("apk_weekdays", None)
+        await apk_weekday_menu(update, context)
         return APK_WEEKDAY
 
     elif data.startswith("menu_"):
@@ -859,7 +801,6 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return MENU
 
     return MENU
-
 
 # ========= 一般提醒選單 Callback =========
 
@@ -895,7 +836,6 @@ async def general_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return SD_DATE
 
     return GENERAL_MENU
-
 
 # ========= 單一日期 flow：日期層 =========
 
@@ -940,7 +880,6 @@ async def single_date_got_date(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=markup,
     )
     return SD_TIME
-
 
 # ========= 單一日期 flow：時間層 =========
 
@@ -1001,7 +940,6 @@ async def single_date_got_time(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     return SD_TEXT
 
-
 # ========= 單一日期 flow：內容層 =========
 
 async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1041,6 +979,7 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
             when=run_at.astimezone(TZ),
             data={
                 "chat_id": chat_id,
+                "text": content,
                 "when_str": when_str,
                 "reminder_id": reminder_id,
             },
@@ -1061,7 +1000,6 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         "還需要我幫你設什麼提醒嗎？",
     )
     return MENU
-
 
 # ========= Bot 啟動邏輯 =========
 
@@ -1084,7 +1022,6 @@ async def run_bot():
                 .build()
             )
 
-            # ConversationHandler：包含整個主選單 + 一般提醒 + 提醒列表 + 人員名單 + APK 提醒
             conv_handler = ConversationHandler(
                 entry_points=[CommandHandler("start", start)],
                 states={
@@ -1093,42 +1030,61 @@ async def run_bot():
                     ],
                     GENERAL_MENU: [
                         CallbackQueryHandler(general_menu_callback),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
                     SD_DATE: [
                         CallbackQueryHandler(back_from_date_to_general, pattern="^back_to_general$"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_date),
                     ],
                     SD_TIME: [
                         CallbackQueryHandler(back_from_time_to_date, pattern="^back_to_date$"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_time),
                     ],
                     SD_TEXT: [
                         CallbackQueryHandler(back_from_text_to_time, pattern="^back_to_time$"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, single_date_got_text),
                     ],
                     REMINDER_LIST: [
                         CallbackQueryHandler(reminder_list_callback),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
                     PEOPLE_MENU: [
-                        CallbackQueryHandler(people_menu_callback, pattern="^menu_people$|^people_"),
+                        CallbackQueryHandler(people_menu_callback, pattern="^people_"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
                     PEOPLE_ADD: [
                         CallbackQueryHandler(people_menu_callback, pattern="^people_"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, people_add_got_text),
                     ],
                     PEOPLE_DELETE: [
                         CallbackQueryHandler(people_delete_callback, pattern="^people_"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
-                    APK_WEEKDAY: [
-                        CallbackQueryHandler(apk_weekday_callback, pattern="^apk_"),
+                            PEOPLE_DELETE: [
+            CallbackQueryHandler(people_delete_callback, pattern="^people_"),
+            CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
-                    APK_TIME: [
-                        CallbackQueryHandler(apk_back_to_weekday, pattern="^apk_back_weekday$"),
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, apk_got_time),
+
+        # ===== APK 三個狀態 =====
+                            APK_WEEKDAY: [
+            # 處理勾選 / 取消星期 + 下一步 / 返回
+            CallbackQueryHandler(apk_weekday_callback, pattern="^apk_"),
+            CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
-                    APK_TEXT: [
-                        CallbackQueryHandler(apk_back_to_time, pattern="^apk_back_time$"),
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, apk_got_text),
+                            APK_TIME: [
+            # 在這一層只收「時間文字 HHMM」
+            CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, apk_time_got),
+                    ],
+                            APK_TEXT: [
+            # 在這層既要處理選擇 @ 人的 callback（apk_at_*），也要收文字（內容）
+            CallbackQueryHandler(apk_at_callback, pattern="^apk_"),
+            CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, apk_text_got),
                     ],
                 },
                 fallbacks=[CommandHandler("start", start)],
@@ -1160,9 +1116,8 @@ async def run_bot():
             await asyncio.sleep(5)
 
         except Exception as e:
-            logger.exception("run_bot 發生未預期錯誤：%s，30 秒後重試。", e)
+            logger.exception("run_bot 發生未預期錯誤：%s", e)
             await asyncio.sleep(30)
-
 
 # ========= Background Worker 入口點 =========
 
