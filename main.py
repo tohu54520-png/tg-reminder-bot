@@ -53,7 +53,7 @@ app = FastAPI()
     PEOPLE_MENU,          # 人員名單選單
     PEOPLE_ADD,           # 人員名單 ➜ 新增
     PEOPLE_DELETE,        # 人員名單 ➜ 刪除
-) = range(8)
+) = range(9)
 
 # ========= FastAPI =========
 
@@ -655,3 +655,4 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     pass
+
