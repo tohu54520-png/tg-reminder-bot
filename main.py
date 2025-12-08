@@ -9,13 +9,16 @@ app = FastAPI()
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+
 @app.get("/")
 def home():
     return {"status": "TG Bot is running on Render ✅"}
 
+
 @dp.message()
 async def echo(message: Message):
     await message.answer(f"你剛剛說的是：\n{message.text}")
+
 
 @app.post("/webhook")
 async def telegram_webhook(update: dict):
