@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut
+from telegram.error import Conflict, TimedOut
 
 # ========= 基本設定 =========
 
@@ -1411,23 +1411,22 @@ async def run_bot():
                         CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
 
-
-        # ===== APK 三個狀態 =====
-                            APK_WEEKDAY: [
-            # 處理勾選 / 取消星期 + 下一步 / 返回
-            CallbackQueryHandler(apk_weekday_callback, pattern="^apk_"),
-            CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
+                    # ===== APK 三個狀態 =====
+                    APK_WEEKDAY: [
+                        # 處理勾選 / 取消星期 + 下一步 / 返回
+                        CallbackQueryHandler(apk_weekday_callback, pattern="^apk_"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
-                            APK_TIME: [
-            # 在這一層只收「時間文字 HHMM」
-            CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, apk_time_got),
+                    APK_TIME: [
+                        # 在這一層只收「時間文字 HHMM"
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, apk_time_got),
                     ],
-                            APK_TEXT: [
-            # 在這層既要處理選擇 @ 人的 callback（apk_at_*），也要收文字（內容）
-            CallbackQueryHandler(apk_at_callback, pattern="^apk_"),
-            CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, apk_text_got),
+                    APK_TEXT: [
+                        # 在這層既要處理選擇 @ 人的 callback（apk_at_*），也要收文字（內容）
+                        CallbackQueryHandler(apk_at_callback, pattern="^apk_"),
+                        CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, apk_text_got),
                     ],
                 },
                 fallbacks=[CommandHandler("start", start)],
@@ -1437,31 +1436,32 @@ async def run_bot():
             application.add_handler(conv_handler)
             application.add_handler(CommandHandler("help", cmd_help))
 
-            # 初始化 & 啟動 bot
-            await application.initialize()
-            await application.start()
-            await application.updater.start_polling()
+            logger.info("Deleting webhook (if any) and starting polling...")
+            await application.bot.delete_webhook(drop_pending_updates=True)
 
-            logger.info("Telegram bot started (polling).")
+            await application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                stop_signals=None,
+                close_loop=False,
+                drop_pending_updates=True,
+            )
 
-            # 讓 bot 一直活著，直到被取消
-            try:
-                while True:
-                    await asyncio.sleep(3600)
-            finally:
-                logger.info("Stopping Telegram bot...")
-                await application.updater.stop()
-                await application.stop()
-                await application.shutdown()
+            logger.info("Telegram bot stopped gracefully, restarting in 5 seconds...")
+            await asyncio.sleep(5)
 
         except TimedOut:
             logger.warning("Telegram API TimedOut，5 秒後重試啟動 bot。")
             await asyncio.sleep(5)
 
+        except Conflict:
+            logger.warning(
+                "偵測到多重 getUpdates 衝突，稍後重試（可能已有其他 bot 實例在運行）。"
+            )
+            await asyncio.sleep(15)
+
         except Exception as e:
             logger.exception("run_bot 發生未預期錯誤：%s", e)
             await asyncio.sleep(30)
-
 # ========= Background Worker 入口點 =========
 
 async def main():
@@ -1472,3 +1472,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
