@@ -148,12 +148,13 @@ def db_get_reminder(reminder_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, chat_id, kind, run_at, text FROM reminders WHERE id=?",
+        "SELECT id, chat_id, kind, run_at, text, meta FROM reminders WHERE id=?",
         (reminder_id,),
     )
     row = cur.fetchone()
     conn.close()
     return row
+
 
 
 def db_delete_reminder(reminder_id: int):
@@ -1468,6 +1469,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
