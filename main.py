@@ -1436,7 +1436,7 @@ def run_bot():
             application.add_handler(CommandHandler("help", cmd_help))
 
             logger.info("Deleting webhook (if any) and starting polling...")
-            application.bot.delete_webhook(drop_pending_updates=True)
+            
 
             application.run_polling(
                 allowed_updates=Update.ALL_TYPES,
@@ -1469,6 +1469,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
