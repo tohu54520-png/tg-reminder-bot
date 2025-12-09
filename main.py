@@ -1333,8 +1333,10 @@ async def single_date_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ========= Bot 啟動邏輯 =========
 
-async def run_bot():
+def run_bot():
     """持續啟動 / 維持 Telegram Bot。"""
+    import time
+
     while True:
         try:
             logger.info("Building Telegram application...")
@@ -1352,6 +1354,7 @@ async def run_bot():
                 .build()
             )
 
+            # ===== 加入 Handlers =====
             conv_handler = ConversationHandler(
                 entry_points=[CommandHandler("start", start)],
                 states={
@@ -1410,20 +1413,15 @@ async def run_bot():
                         CallbackQueryHandler(people_delete_callback, pattern="^people_"),
                         CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
-
-                    # ===== APK 三個狀態 =====
                     APK_WEEKDAY: [
-                        # 處理勾選 / 取消星期 + 下一步 / 返回
                         CallbackQueryHandler(apk_weekday_callback, pattern="^apk_"),
                         CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                     ],
                     APK_TIME: [
-                        # 在這一層只收「時間文字 HHMM"
                         CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, apk_time_got),
                     ],
                     APK_TEXT: [
-                        # 在這層既要處理選擇 @ 人的 callback（apk_at_*），也要收文字（內容）
                         CallbackQueryHandler(apk_at_callback, pattern="^apk_"),
                         CallbackQueryHandler(main_menu_callback, pattern="^menu_"),
                         MessageHandler(filters.TEXT & ~filters.COMMAND, apk_text_got),
@@ -1437,39 +1435,39 @@ async def run_bot():
             application.add_handler(CommandHandler("help", cmd_help))
 
             logger.info("Deleting webhook (if any) and starting polling...")
-            await application.bot.delete_webhook(drop_pending_updates=True)
+            application.bot.delete_webhook(drop_pending_updates=True)
 
-            await application.run_polling(
+            application.run_polling(
                 allowed_updates=Update.ALL_TYPES,
-                stop_signals=None,
-                close_loop=False,
                 drop_pending_updates=True,
             )
 
-            logger.info("Telegram bot stopped gracefully, restarting in 5 seconds...")
-            await asyncio.sleep(5)
+            logger.info("Telegram bot stopped, restarting in 5 seconds...")
+            time.sleep(5)
 
         except TimedOut:
             logger.warning("Telegram API TimedOut，5 秒後重試啟動 bot。")
-            await asyncio.sleep(5)
+            time.sleep(5)
 
         except Conflict:
-            logger.warning(
-                "偵測到多重 getUpdates 衝突，稍後重試（可能已有其他 bot 實例在運行）。"
-            )
-            await asyncio.sleep(15)
+            logger.warning("偵測到多重 getUpdates 衝突，15 秒後重試。")
+            time.sleep(15)
 
         except Exception as e:
             logger.exception("run_bot 發生未預期錯誤：%s", e)
-            await asyncio.sleep(30)
+            time.sleep(30)
+
 # ========= Background Worker 入口點 =========
 
-async def main():
+def main():
     logger.info("Worker starting, init DB and bot...")
     init_db()
-    await run_bot()
+    run_bot()
+
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
+
+
 
