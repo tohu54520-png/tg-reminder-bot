@@ -70,6 +70,20 @@ logger = logging.getLogger("main")
 
 # ========= SQLite 工具 =========
 
+def ensure_people_table(cur: sqlite3.Cursor):
+    """確保 people 表存在，避免舊 DB 遺失此表導致查詢失敗。"""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS people (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id  INTEGER NOT NULL,
+            tg_id    TEXT    NOT NULL,   -- 例如 @tohu54520
+            nickname TEXT    NOT NULL    -- 例如 豆腐
+        )
+        """
+    )
+
+
 def init_db():
     """初始化 SQLite 資料庫。"""
     conn = sqlite3.connect(DB_PATH)
@@ -94,6 +108,9 @@ def init_db():
         cur.execute("ALTER TABLE reminders ADD COLUMN meta TEXT")
     except sqlite3.OperationalError:
         pass
+
+    # 人員名單表：可被 @ 的人
+    ensure_people_table(cur)
 
     conn.commit()
     conn.close()
@@ -131,7 +148,7 @@ def db_get_reminder(reminder_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, chat_id, kind, run_at, text, meta FROM reminders WHERE id=?",
+        "SELECT id, chat_id, kind, run_at, text FROM reminders WHERE id=?",
         (reminder_id,),
     )
     row = cur.fetchone()
@@ -183,6 +200,7 @@ def db_list_people(chat_id: int):
     """列出某個聊天室目前所有可 @ 的人員名單。"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    ensure_people_table(cur)
     cur.execute(
         "SELECT id, tg_id, nickname FROM people WHERE chat_id=? ORDER BY id ASC",
         (chat_id,),
@@ -203,6 +221,7 @@ def db_add_people_batch(chat_id: int, pairs: list[tuple[str, str]]) -> int:
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    ensure_people_table(cur)
     cur.executemany(
         "INSERT INTO people (chat_id, tg_id, nickname) VALUES (?, ?, ?)",
         [(chat_id, tg, nick) for tg, nick in pairs],
@@ -217,6 +236,7 @@ def db_delete_person(person_id: int):
     """刪除單一人員名單。"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    ensure_people_table(cur)
     cur.execute("DELETE FROM people WHERE id=?", (person_id,))
     conn.commit()
     conn.close()
@@ -597,9 +617,9 @@ async def apk_weekday_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return APK_WEEKDAY
 
         await query.message.reply_text(
-        "請輸入提醒時間（HHMM，例如：0930 或 1830）："
-    )
-    return APK_TIME
+            "請輸入提醒時間（HHMM，例如：0930 或 1830）："
+        )
+        return APK_TIME
 
     if data == "apk_wd_back":
         await send_main_menu(chat_id, context)
@@ -616,7 +636,7 @@ async def apk_time_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return APK_TIME
 
     context.user_data["apk_time"] = parsed
-    await update.message.reply_text("請輸入提醒內容（留空使用預設：本週 APK 更新請記錄）：")
+    await update.message.reply_text("請輸入提醒內容（例如：本週 APK 更新請記錄）：")
     return APK_TEXT
 
 
@@ -625,7 +645,8 @@ async def apk_time_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def apk_text_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
-        text = "本週 APK 更新請記錄"
+        await update.message.reply_text("提醒內容不能為空，請重新輸入。")
+        return APK_TEXT
 
     context.user_data["apk_text"] = text
 
@@ -1451,4 +1472,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
