@@ -7,6 +7,7 @@ group-specific reminders for various use cases (一般提醒、谷歌APK提醒�
 import os
 import asyncio
 import logging
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -57,12 +58,14 @@ logger = logging.getLogger("main")
     GENERAL_TIME,
     GENERAL_TEXT,
     GENERAL_MENTIONS,
+    LOTTERY_MENU,
+    LOTTERY_MENTIONS,
 
-    APK_WEEKDAY,     # 選星期
-    APK_TIME,        # 選時間 HHMM
-    APK_TEXT,        # 輸入內容
-    APK_TAG_PEOPLE,  # 選 @ 人
-) = range(17)
+    APK_WEEKDAY,     # 選星期␊
+    APK_TIME,        # 選時間 HHMM␊
+    APK_TEXT,        # 輸入內容␊
+    APK_TAG_PEOPLE,  # 選 @ 人␊
+) = range(19)
 
 
 # ========= SQLite 工具 =========
@@ -80,34 +83,31 @@ def init_db():
             chat_id INTEGER NOT NULL,
             kind    TEXT    NOT NULL,   -- general_single / apk / lottery ... etc
             run_at  INTEGER NOT NULL,   -- Unix timestamp（秒）
-            text    TEXT    NOT NULL
+            text    TEXT    NOT NULL,
+            meta    TEXT
         )
         """
     )
 
-    # 人員名單表：可被 @ 的人
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS people (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id  INTEGER NOT NULL,
-            tg_id    TEXT    NOT NULL,   -- 例如 @tohu54520
-            nickname TEXT    NOT NULL    -- 例如 豆腐
-        )
-        """
-    )
+    # 確保舊版本 DB 也有 meta 欄位
+    try:
+        cur.execute("ALTER TABLE reminders ADD COLUMN meta TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
     conn.close()
     logger.info("DB initialized.")
 
 
-def db_add_reminder(chat_id: int, kind: str, run_at: datetime, text: str) -> int:
+def db_add_reminder(
+    chat_id: int, kind: str, run_at: datetime, text: str, meta: dict | None = None
+) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO reminders (chat_id, kind, run_at, text) VALUES (?, ?, ?, ?)",
-        (chat_id, kind, int(run_at.timestamp()), text),
+        "INSERT INTO reminders (chat_id, kind, run_at, text, meta) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, kind, int(run_at.timestamp()), text, json.dumps(meta or {})),
     )
     reminder_id = cur.lastrowid
     conn.commit()
@@ -119,7 +119,7 @@ def db_list_reminders(chat_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, kind, run_at, text FROM reminders WHERE chat_id=? ORDER BY run_at ASC",
+        "SELECT id, kind, run_at, text, meta FROM reminders WHERE chat_id=? ORDER BY run_at ASC",
         (chat_id,),
     )
     rows = cur.fetchall()
@@ -131,7 +131,7 @@ def db_get_reminder(reminder_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, chat_id, kind, run_at, text FROM reminders WHERE id=?",
+        "SELECT id, chat_id, kind, run_at, text, meta FROM reminders WHERE id=?",
         (reminder_id,),
     )
     row = cur.fetchone()
@@ -143,6 +143,38 @@ def db_delete_reminder(reminder_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_update_reminder(
+    reminder_id: int,
+    *,
+    run_at: datetime | None = None,
+    text: str | None = None,
+    meta: dict | None = None,
+):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    sets = []
+    params: list[object] = []
+    if run_at is not None:
+        sets.append("run_at=?")
+        params.append(int(run_at.timestamp()))
+    if text is not None:
+        sets.append("text=?")
+        params.append(text)
+    if meta is not None:
+        sets.append("meta=?")
+        params.append(json.dumps(meta))
+
+    if not sets:
+        conn.close()
+        return
+
+    params.append(reminder_id)
+    sql = f"UPDATE reminders SET {', '.join(sets)} WHERE id=?"
+    cur.execute(sql, params)
     conn.commit()
     conn.close()
 
@@ -221,6 +253,37 @@ def format_ts(ts: int) -> str:
     """把 timestamp 轉成 MM/DD HH:MM（台北時間）。"""
     dt = datetime.fromtimestamp(ts, TZ)
     return dt.strftime("%m/%d %H:%M")
+
+
+def parse_meta(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+def get_people_lookup(chat_id: int):
+    """回傳 {person_id: tg_id, ...} 的字典。"""
+    people = db_list_people(chat_id)
+    return {pid: tg for pid, tg, _nick in people}
+
+
+def build_mention_lines(chat_id: int, mention_ids: list[int] | set[int]):
+    lookup = get_people_lookup(chat_id)
+    selected = []
+    for pid in mention_ids:
+        tg = lookup.get(pid)
+        if tg:
+            selected.append(tg)
+    return selected
+
+
+def build_text_with_mentions(base_text: str, mentions: list[str]):
+    if mentions:
+        return base_text + "\n" + "\n".join(mentions)
+    return base_text
 
 
 async def send_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str = "請選擇功能："):
@@ -411,15 +474,6 @@ async def finalize_general_cycle(update: Update, context: ContextTypes.DEFAULT_T
     text = context.user_data.get("gen_text")
     mention_ids = context.user_data.get("gen_mentions", set())
 
-    mentions = []
-    if mention_ids:
-        people = db_list_people(chat_id)
-        for pid, tg_id, nickname in people:
-            if pid in mention_ids:
-                mentions.append(tg_id)
-
-    mention_str = "\n".join(mentions)
-
     now = datetime.now(TZ)
     labels = ["一", "二", "三", "四", "五", "六", "日"]
     created = 0
@@ -436,20 +490,25 @@ async def finalize_general_cycle(update: Update, context: ContextTypes.DEFAULT_T
         mmdd = run_at.strftime("%m/%d")
         label = labels[wd]
 
-        final_text = f"【固定週期｜週{label}】{text}"
-        if mention_str:
-            final_text += f"\n{mention_str}"
+        base_text = f"【固定週期｜週{label}】{text}"
+        mentions = build_mention_lines(chat_id, mention_ids)
+        final_text = build_text_with_mentions(base_text, mentions)
 
-        reminder_id = db_add_reminder(chat_id, "general_cycle", run_at, final_text)
+        meta = {
+            "base_text": base_text,
+            "mentions": list(mention_ids),
+            "recurrence": {"type": "weekly", "weekday": wd, "interval_days": 7},
+        }
+
+        reminder_id = db_add_reminder(chat_id, "general_cycle", run_at, final_text, meta=meta)
 
         job_name = f"reminder-{reminder_id}"
-        context.application.job_queue.run_once(
+        context.application.job_queue.run_repeating(
             reminder_job,
-            when=run_at,
+            interval=timedelta(days=7),
+            first=run_at,
             data={
                 "chat_id": chat_id,
-                "text": final_text,
-                "when_str": mmdd,
                 "reminder_id": reminder_id,
             },
             name=job_name,
@@ -538,9 +597,9 @@ async def apk_weekday_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return APK_WEEKDAY
 
         await query.message.reply_text(
-            "請輸入提醒時間（HHMM，例如：0930 或 1830）："
-        )
-        return APK_TIME
+        "請輸入提醒時間（HHMM，例如：0930 或 1830）："
+    )
+    return APK_TIME
 
     if data == "apk_wd_back":
         await send_main_menu(chat_id, context)
@@ -557,7 +616,7 @@ async def apk_time_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return APK_TIME
 
     context.user_data["apk_time"] = parsed
-    await update.message.reply_text("請輸入提醒內容（例如：本週 APK 更新請記錄）：")
+    await update.message.reply_text("請輸入提醒內容（留空使用預設：本週 APK 更新請記錄）：")
     return APK_TEXT
 
 
@@ -566,8 +625,7 @@ async def apk_time_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def apk_text_got(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
-        await update.message.reply_text("提醒內容不能為空，請重新輸入。")
-        return APK_TEXT
+        text = "本週 APK 更新請記錄"
 
     context.user_data["apk_text"] = text
 
@@ -630,15 +688,6 @@ async def finalize_apk_schedule(update: Update, context: ContextTypes.DEFAULT_TY
     text = context.user_data.get("apk_text")
     mention_ids = context.user_data.get("apk_mentions", set())
 
-    mentions = []
-    if mention_ids:
-        people = db_list_people(chat_id)
-        for pid, tg_id, nickname in people:
-            if pid in mention_ids:
-                mentions.append(tg_id)
-
-    mention_str = "\n".join(mentions)
-
     now = datetime.now(TZ)
     labels = ["一", "二", "三", "四", "五", "六", "日"]
 
@@ -654,25 +703,26 @@ async def finalize_apk_schedule(update: Update, context: ContextTypes.DEFAULT_TY
         if run_at <= now:
             run_at += timedelta(days=7)
 
-        mmdd = run_at.strftime("%m/%d")
         label = labels[wd]
 
-        final_text = f"【{mmdd}】【谷歌】【PROD】本周{label}APK更新-紀錄單\n{text}"
-        if mention_str:
-            final_text += f"\n{mention_str}"
+        base_text = f"【谷歌】【PROD】本周{label}APK更新-紀錄單\n{text}"
+        mentions = build_mention_lines(chat_id, mention_ids)
+        final_text = build_text_with_mentions(base_text, mentions)
 
-        reminder_id = db_add_reminder(chat_id, "apk", run_at, final_text)
+        meta = {
+            "base_text": base_text,
+            "mentions": list(mention_ids),
+            "recurrence": {"type": "weekly", "weekday": wd, "interval_days": 7},
+        }
+
+        reminder_id = db_add_reminder(chat_id, "apk", run_at, final_text, meta=meta)
 
         job_name = f"apk-{reminder_id}_{wd}"
-        context.application.job_queue.run_once(
+        context.application.job_queue.run_repeating(
             reminder_job,
-            when=run_at,
-            data={
-                "chat_id": chat_id,
-                "text": final_text,
-                "when_str": mmdd,
-                "reminder_id": reminder_id,
-            },
+            interval=timedelta(days=7),
+            first=run_at,
+            data={"chat_id": chat_id, "reminder_id": reminder_id},
             name=job_name,
         )
 
@@ -696,21 +746,37 @@ async def finalize_apk_schedule(update: Update, context: ContextTypes.DEFAULT_TY
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
-    text = data["text"]
-    when_str = data["when_str"]
     reminder_id = data.get("reminder_id")
+    row = db_get_reminder(reminder_id) if reminder_id else None
+    meta = {}
+    if row:
+        _id, chat_id, kind, run_at, text, raw_meta = row
+        meta = parse_meta(raw_meta)
+        when_str = format_ts(run_at)
+        mentions = build_mention_lines(chat_id, meta.get("mentions", []))
+        base_text = meta.get("base_text", text)
+        text_to_send = build_text_with_mentions(base_text, mentions)
+    else:
+        text_to_send = data.get("text", "")
+        when_str = data.get("when_str", "")
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"⏰ 提醒時間到囉（{when_str}）：\n{text}",
+        text=f"⏰ 提醒時間到囉（{when_str}）：\n{text_to_send}",
     )
 
-    # Job 執行完，把這筆提醒從 DB 刪掉（如果還在）
+    recurrence = meta.get("recurrence") if meta else None
     if reminder_id is not None:
-        try:
-            db_delete_reminder(reminder_id)
-        except Exception as e:
-            logger.warning("刪除提醒（ID=%s）時發生錯誤：%s", reminder_id, e)
+        if recurrence and recurrence.get("type") == "weekly":
+            next_run = datetime.fromtimestamp(row[3], TZ) + timedelta(
+                days=recurrence.get("interval_days", 7)
+            )
+            db_update_reminder(reminder_id, run_at=next_run)
+        else:
+            try:
+                db_delete_reminder(reminder_id)
+            except Exception as e:
+                logger.warning("刪除提醒（ID=%s）時發生錯誤：%s", reminder_id, e)
 
 # ========= 指令處理 =========
 
@@ -744,7 +810,7 @@ async def send_reminder_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = []
-    for rid, kind, run_at, text in rows:
+    for rid, kind, run_at, text, raw_meta in rows:
         when_str = format_ts(run_at)
         kind_label = {
             "general_single": "一般提醒",
@@ -752,6 +818,8 @@ async def send_reminder_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             "apk": "谷歌APK",
             "lottery": "香港六合彩",
         }.get(kind, kind)
+        meta = parse_meta(raw_meta)
+        base_text = meta.get("base_text", text)
         label = f"{when_str}｜{kind_label}"
         keyboard.append(
             [InlineKeyboardButton(label, callback_data=f"reminder_{rid}")]
@@ -810,7 +878,7 @@ async def reminder_list_callback(update: Update, context: ContextTypes.DEFAULT_T
             await send_reminder_list(chat_id, context)
             return REMINDER_LIST
 
-        _id, _chat_id, kind, run_at, text = row
+        _id, _chat_id, kind, run_at, text, raw_meta = row
         when_str = format_ts(run_at)
         kind_label = {
             "general_single": "一般提醒",
@@ -818,13 +886,21 @@ async def reminder_list_callback(update: Update, context: ContextTypes.DEFAULT_T
             "lottery": "香港六合彩",
         }.get(kind, kind)
 
+        meta = parse_meta(raw_meta)
+        mentions = build_mention_lines(chat_id, meta.get("mentions", []))
+        mention_str = "\n".join(mentions)
+        base_text = meta.get("base_text", text)
+
         detail = (
             f"【提醒詳細】\n"
             f"類型：{kind_label}\n"
             f"時間：{when_str}\n"
-            f"內容：{text}\n\n"
-            f"目前先提供刪除功能，時間／內容編輯之後再幫你加上。"
+            f"內容：{base_text}\n"
         )
+        if mention_str:
+            detail += f"@：{mention_str}\n"
+
+        detail += "\n可直接刪除提醒。時間／@ 人修改功能開發中。"
 
         keyboard = [
             [InlineKeyboardButton("🗑 刪除提醒", callback_data=f"reminder_delete_{rid}")],
@@ -1375,3 +1451,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
